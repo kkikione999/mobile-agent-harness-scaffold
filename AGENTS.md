@@ -4,6 +4,23 @@
 
 Keep this repo deterministic, observable, and machine-verifiable for mobile simulator testing.
 
+## Project map (current)
+
+```text
+.
+├── harness/            # Core harness logic (driver, evidence, oracle, triage)
+├── scenarios/smoke/    # Executable test scenarios
+├── tools/              # CLI entrypoints (run, eval, replay, package, selectors)
+├── tests/              # Unit/integration checks for harness + DSL
+├── config/             # Device and environment config
+├── rules/              # Oracle evaluation rules
+├── scripts/            # Simulator/device helper scripts
+├── docs/               # Architecture and runbook docs
+├── runs/<run-id>/      # Per-run artifacts and evidence
+├── Makefile            # Standard task entrypoints
+└── AGENTS.md           # Repo working contract
+```
+
 ## Ground rules
 
 - Do not add new scenario formats without updating `harness/driver/dsl.py` and `tests/`.
