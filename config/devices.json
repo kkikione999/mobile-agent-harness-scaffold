@@ -1,0 +1,10 @@
+{
+  "android": {
+    "avd_name": "Pixel_8_API_34",
+    "package": "com.example.app"
+  },
+  "ios": {
+    "simulator_name": "iPhone 16",
+    "bundle_id": "com.example.app"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "ios-cold-start",
+  "dsl_version": "1.0",
+  "platform": "ios",
+  "app": {
+    "ios_bundle_id": "com.example.app"
+  },
+  "steps": [
+    {"action": "launch_app"},
+    {"action": "wait", "seconds": 2},
+    {"action": "assert_visible", "target": "home_screen"}
+  ]
+}
