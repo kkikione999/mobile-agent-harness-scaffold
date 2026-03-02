@@ -14,6 +14,8 @@ class EvidenceBus:
     summary_path: Path = field(init=False)
     snapshots_dir: Path = field(init=False)
     diffs_dir: Path = field(init=False)
+    raw_trees_dir: Path = field(init=False)
+    traces_dir: Path = field(init=False)
     counts: dict[str, int] = field(
         default_factory=lambda: {
             "events": 0,
@@ -29,8 +31,12 @@ class EvidenceBus:
         self.summary_path = self.run_dir / "summary.json"
         self.snapshots_dir = self.run_dir / "snapshots"
         self.diffs_dir = self.run_dir / "diffs"
+        self.raw_trees_dir = self.run_dir / "raw_trees"
+        self.traces_dir = self.run_dir / "capture_traces"
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
         self.diffs_dir.mkdir(parents=True, exist_ok=True)
+        self.raw_trees_dir.mkdir(parents=True, exist_ok=True)
+        self.traces_dir.mkdir(parents=True, exist_ok=True)
 
     def write_snapshot(self, step_index: int, label: str, payload: dict[str, Any]) -> str:
         rel_path = Path("snapshots") / f"{step_index:03d}-{label}.json"
@@ -40,6 +46,18 @@ class EvidenceBus:
 
     def write_diff(self, step_index: int, payload: dict[str, Any]) -> str:
         rel_path = Path("diffs") / f"{step_index:03d}.json"
+        abs_path = self.run_dir / rel_path
+        abs_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+        return str(rel_path)
+
+    def write_raw_tree(self, step_index: int, label: str, payload: dict[str, Any] | list[Any]) -> str:
+        rel_path = Path("raw_trees") / f"{step_index:03d}-{label}.json"
+        abs_path = self.run_dir / rel_path
+        abs_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+        return str(rel_path)
+
+    def write_capture_trace(self, step_index: int, label: str, payload: dict[str, Any]) -> str:
+        rel_path = Path("capture_traces") / f"{step_index:03d}-{label}.json"
         abs_path = self.run_dir / rel_path
         abs_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
         return str(rel_path)

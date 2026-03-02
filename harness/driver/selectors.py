@@ -26,6 +26,10 @@ def build_anchor(node: dict[str, Any]) -> dict[str, Any]:
         "type": node.get("type"),
         "text": node.get("text"),
         "path": node.get("path"),
+        "resource_id": node.get("resource_id"),
+        "class_name": node.get("class_name"),
+        "content_desc": node.get("content_desc"),
+        "bounds": node.get("bounds"),
     }
 
 
@@ -41,15 +45,23 @@ def make_selector(by: str, value: str, within: str | None = None, platform_hint:
 def _anchor_score(anchor: dict[str, Any], node: dict[str, Any]) -> float:
     score = 0.0
     if anchor.get("id") and anchor.get("id") == node.get("id"):
-        score += 0.4
-    if anchor.get("label") and anchor.get("label") == node.get("label"):
+        score += 0.3
+    if anchor.get("resource_id") and anchor.get("resource_id") == node.get("resource_id"):
         score += 0.25
+    if anchor.get("label") and anchor.get("label") == node.get("label"):
+        score += 0.15
     if anchor.get("type") and anchor.get("type") == node.get("type"):
-        score += 0.2
-    if anchor.get("text") and anchor.get("text") == node.get("text"):
         score += 0.1
-    if anchor.get("path") and anchor.get("path") == node.get("path"):
+    if anchor.get("class_name") and anchor.get("class_name") == node.get("class_name"):
+        score += 0.1
+    if anchor.get("content_desc") and anchor.get("content_desc") == node.get("content_desc"):
         score += 0.05
+    if anchor.get("text") and anchor.get("text") == node.get("text"):
+        score += 0.03
+    if anchor.get("path") and anchor.get("path") == node.get("path"):
+        score += 0.01
+    if anchor.get("bounds") and anchor.get("bounds") == node.get("bounds"):
+        score += 0.01
     return score
 
 
@@ -82,6 +94,12 @@ def resolve_selector(
 
     if by == "id":
         candidates = [el for el in elements if str(el.get("id", "")) == value]
+    elif by == "resource_id":
+        candidates = [el for el in elements if str(el.get("resource_id", "")) == value]
+    elif by == "content_desc":
+        candidates = [el for el in elements if str(el.get("content_desc", "")) == value]
+    elif by == "class_name":
+        candidates = [el for el in elements if str(el.get("class_name", "")) == value]
     elif by == "label":
         candidates = [el for el in elements if str(el.get("label", "")) == value]
     elif by == "text":

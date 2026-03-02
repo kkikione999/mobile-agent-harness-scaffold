@@ -29,17 +29,31 @@ class DeviceHarness(ABC):
     def _seed_state(self) -> None:
         self._visible_targets = {"launch_screen"}
 
+    def preflight(self) -> dict[str, Any]:
+        return {"status": "ok", "details": "no preflight checks"}
+
     def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         _ = options or {}
         elements = self._build_elements()
         return {
-            "schema_version": "cat.v1",
+            "schema_version": "cat.v2",
             "platform": self.platform,
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "root": elements[0]["ref"],
             "elements": elements,
             "tree_hash": self._tree_hash(elements),
             "element_map": {el["id"]: el["ref"] for el in elements if el.get("id")},
+            "capture_source": "synthetic_state_model",
+            "capture_latency_ms": 0,
+            "source_request_id": None,
+            "normalization_report": {
+                "version": "synthetic.v1",
+                "warnings": [],
+            },
+            "capture_trace": {
+                "capture_source": "synthetic_state_model",
+                "details": "snapshot generated from local harness state",
+            },
         }
 
     def diff(self, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
@@ -49,24 +63,106 @@ class DeviceHarness(ABC):
         added = sorted(ref for ref in after_map if ref not in before_map)
         removed = sorted(ref for ref in before_map if ref not in after_map)
 
-        text_changed: list[dict[str, Any]] = []
-        for ref in sorted(set(before_map).intersection(after_map)):
-            before_text = str(before_map[ref].get("text", ""))
-            after_text = str(after_map[ref].get("text", ""))
-            if before_text != after_text:
-                text_changed.append({"ref": ref, "before": before_text, "after": after_text})
-
         changes: list[dict[str, Any]] = []
         for ref in added:
-            changes.append({"type": "node_added", "ref": ref})
+            changes.append(
+                {
+                    "type": "node_added",
+                    "ref": ref,
+                    "before": None,
+                    "after": after_map.get(ref),
+                    "source_fields": [],
+                }
+            )
         for ref in removed:
-            changes.append({"type": "node_removed", "ref": ref})
-        for item in text_changed:
-            changes.append({"type": "text_changed", **item})
+            changes.append(
+                {
+                    "type": "node_removed",
+                    "ref": ref,
+                    "before": before_map.get(ref),
+                    "after": None,
+                    "source_fields": [],
+                }
+            )
+
+        attr_fields = {"id", "label", "type", "text", "resource_id", "content_desc", "class_name"}
+        state_fields = {
+            "interactive",
+            "clickable",
+            "enabled",
+            "visible",
+            "focusable",
+            "checked",
+            "selected",
+            "editable",
+        }
+        common_refs = sorted(set(before_map).intersection(after_map))
+        for ref in common_refs:
+            left = before_map[ref]
+            right = after_map[ref]
+
+            attr_changes = [field for field in sorted(attr_fields) if left.get(field) != right.get(field)]
+            if attr_changes:
+                changes.append(
+                    {
+                        "type": "attr_changed",
+                        "ref": ref,
+                        "before": {field: left.get(field) for field in attr_changes},
+                        "after": {field: right.get(field) for field in attr_changes},
+                        "source_fields": attr_changes,
+                    }
+                )
+
+            if left.get("bounds") != right.get("bounds"):
+                changes.append(
+                    {
+                        "type": "bounds_changed",
+                        "ref": ref,
+                        "before": {"bounds": left.get("bounds")},
+                        "after": {"bounds": right.get("bounds")},
+                        "source_fields": ["bounds"],
+                    }
+                )
+
+            changed_state = [field for field in sorted(state_fields) if left.get(field) != right.get(field)]
+            if changed_state:
+                changes.append(
+                    {
+                        "type": "state_changed",
+                        "ref": ref,
+                        "before": {field: left.get(field) for field in changed_state},
+                        "after": {field: right.get(field) for field in changed_state},
+                        "source_fields": changed_state,
+                    }
+                )
+
+        before_source = {
+            str(item["source_node_id"]): item
+            for item in before_map.values()
+            if item.get("source_node_id") is not None
+        }
+        after_source = {
+            str(item["source_node_id"]): item
+            for item in after_map.values()
+            if item.get("source_node_id") is not None
+        }
+        for source_id in sorted(set(before_source).intersection(after_source)):
+            left = before_source[source_id]
+            right = after_source[source_id]
+            if left.get("ref") != right.get("ref"):
+                changes.append(
+                    {
+                        "type": "subtree_moved",
+                        "ref": right.get("ref"),
+                        "before": {"ref": left.get("ref"), "path": left.get("path")},
+                        "after": {"ref": right.get("ref"), "path": right.get("path")},
+                        "source_fields": ["path"],
+                    }
+                )
 
         change_types = sorted({item["type"] for item in changes})
         return {
-            "schema_version": "cat.diff.v1",
+            "schema_version": "cat.diff.v2",
             "before_tree_hash": before.get("tree_hash"),
             "after_tree_hash": after.get("tree_hash"),
             "change_count": len(changes),
@@ -102,7 +198,8 @@ class DeviceHarness(ABC):
             return {"status": "error", "details": f"unsupported action: {op}", "command": None}
 
         result = self._run_or_record(command)
-        self._apply_state_transition(action)
+        if result.get("status") not in {"error", "fail"}:
+            self._apply_state_transition(action)
         self._last_action = op
 
         if selector_info:
@@ -244,6 +341,20 @@ class DeviceHarness(ABC):
             "path": "0",
             "ordinal": 0,
             "interactive": False,
+            "class_name": "root",
+            "resource_id": "root",
+            "content_desc": self.app_identity(),
+            "bounds": [0, 0, 0, 0],
+            "clickable": False,
+            "enabled": True,
+            "visible": True,
+            "focusable": False,
+            "checked": False,
+            "selected": False,
+            "editable": False,
+            "depth": 0,
+            "index_in_parent": 0,
+            "source_node_id": "root",
         }
         root["ref"] = build_ref(self.platform, root)
         root["anchor"] = build_anchor(root)
@@ -259,6 +370,20 @@ class DeviceHarness(ABC):
                 "path": f"0/{idx}",
                 "ordinal": idx,
                 "interactive": node_type == "input" or target not in {"home_screen", "launch_screen"},
+                "class_name": "android.widget.EditText" if node_type == "input" else "android.view.View",
+                "resource_id": target,
+                "content_desc": target.replace("_", " "),
+                "bounds": [0, idx * 40, 1080, (idx * 40) + 30],
+                "clickable": node_type != "input",
+                "enabled": True,
+                "visible": True,
+                "focusable": node_type == "input",
+                "checked": False,
+                "selected": False,
+                "editable": node_type == "input",
+                "depth": 1,
+                "index_in_parent": idx,
+                "source_node_id": target,
             }
             node["ref"] = build_ref(self.platform, node)
             node["anchor"] = build_anchor(node)

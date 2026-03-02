@@ -54,34 +54,52 @@ def _execute_with_retry(driver: AndroidDriver | IOSDriver, step: dict[str, Any])
     return last_result, max_attempts
 
 
+def _extract_snapshot_artifacts(
+    snapshot: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | list[Any] | None, dict[str, Any] | None]:
+    payload = dict(snapshot)
+    raw_tree = payload.pop("raw_tree", None)
+    capture_trace = payload.pop("capture_trace", None)
+    if not isinstance(capture_trace, dict):
+        capture_trace = None
+    return payload, raw_tree, capture_trace
+
+
 def _run(platform: str, scenario: Scenario, run_dir: Path, dispatch_commands: bool) -> dict[str, Any]:
     bus = EvidenceBus(run_dir=run_dir)
     driver = _driver_for(platform, scenario, dispatch_commands)
 
-    step_results: list[dict[str, Any]] = []
-    for idx, original_step in enumerate(scenario.steps):
-        step = dict(original_step)
-        selector = _normalize_selector(step, platform)
-        if selector:
-            step["selector"] = selector
-            step.setdefault("selector_anchor", selector.get("anchor"))
-
-        before = driver.snapshot({"compact": True, "interactive_only": True})
-        interact_result, attempt = _execute_with_retry(driver, step)
-        after = driver.snapshot({"compact": True, "interactive_only": True})
+    preflight = driver.preflight()
+    if preflight.get("status") in {"error", "fail"}:
+        before_full = driver.snapshot({"compact": True, "interactive_only": True})
+        before, before_raw, before_trace = _extract_snapshot_artifacts(before_full)
+        after = dict(before)
         diff = driver.diff(before, after)
 
-        assertion_result: dict[str, Any] | None = None
-        if step["action"] in ASSERTION_ACTIONS:
-            assertion_result = driver.verify(step)
+        before_ref = bus.write_snapshot(0, "before", before)
+        after_ref = bus.write_snapshot(0, "after", after)
+        diff_ref = bus.write_diff(0, diff)
+        raw_before_ref = None
+        raw_after_ref = None
+        trace_before_ref = None
+        trace_after_ref = None
+        if isinstance(before_raw, (dict, list)):
+            raw_before_ref = bus.write_raw_tree(0, "before", before_raw)
+            raw_after_ref = bus.write_raw_tree(0, "after", before_raw)
+        if before_trace:
+            trace_before_ref = bus.write_capture_trace(0, "before", before_trace)
+            trace_after_ref = bus.write_capture_trace(0, "after", before_trace)
 
-        before_ref = bus.write_snapshot(idx, "before", before)
-        after_ref = bus.write_snapshot(idx, "after", after)
-        diff_ref = bus.write_diff(idx, diff)
         evidence = {
-            "schema_version": "evidence.v1",
+            "schema_version": "evidence.v2",
             "before_snapshot": before_ref,
             "after_snapshot": after_ref,
+            "normalized_before": before_ref,
+            "normalized_after": after_ref,
+            "raw_tree_before": raw_before_ref,
+            "raw_tree_after": raw_after_ref,
+            "capture_trace_before": trace_before_ref,
+            "capture_trace_after": trace_after_ref,
             "diff": diff_ref,
             "before_tree_hash": before.get("tree_hash"),
             "after_tree_hash": after.get("tree_hash"),
@@ -91,8 +109,104 @@ def _run(platform: str, scenario: Scenario, run_dir: Path, dispatch_commands: bo
             },
         }
         metadata = {
+            "schema_version": before.get("schema_version"),
+            "app_integration_status": "error",
+            "bridge_protocol_version": preflight.get("health_payload", {}).get("protocol_version")
+            if isinstance(preflight.get("health_payload"), dict)
+            else None,
+        }
+        bus.record_event(
+            phase="driver",
+            action="bridge_preflight",
+            command=None,
+            result=preflight,
+            step_index=0,
+            evidence=evidence,
+            metadata=metadata,
+        )
+        bus.finalize(
+            extra={
+                "platform": platform,
+                "schema_version": "run.v3",
+                "dsl_version": scenario.dsl_version,
+                "preflight_failed": True,
+            }
+        )
+        return {
+            "steps": [
+                {
+                    "index": 0,
+                    "action": "bridge_preflight",
+                    "result": preflight,
+                    "assertion": None,
+                    "evidence": evidence,
+                }
+            ]
+        }
+
+    step_results: list[dict[str, Any]] = []
+    for idx, original_step in enumerate(scenario.steps):
+        step = dict(original_step)
+        selector = _normalize_selector(step, platform)
+        if selector:
+            step["selector"] = selector
+            step.setdefault("selector_anchor", selector.get("anchor"))
+
+        before_full = driver.snapshot({"compact": True, "interactive_only": True})
+        before, before_raw, before_trace = _extract_snapshot_artifacts(before_full)
+        interact_result, attempt = _execute_with_retry(driver, step)
+        after_full = driver.snapshot({"compact": True, "interactive_only": True})
+        after, after_raw, after_trace = _extract_snapshot_artifacts(after_full)
+        diff = driver.diff(before, after)
+
+        assertion_result: dict[str, Any] | None = None
+        if step["action"] in ASSERTION_ACTIONS:
+            assertion_result = driver.verify(step)
+
+        before_ref = bus.write_snapshot(idx, "before", before)
+        after_ref = bus.write_snapshot(idx, "after", after)
+        diff_ref = bus.write_diff(idx, diff)
+        raw_before_ref = None
+        raw_after_ref = None
+        trace_before_ref = None
+        trace_after_ref = None
+        if isinstance(before_raw, (dict, list)):
+            raw_before_ref = bus.write_raw_tree(idx, "before", before_raw)
+        if isinstance(after_raw, (dict, list)):
+            raw_after_ref = bus.write_raw_tree(idx, "after", after_raw)
+        if before_trace:
+            trace_before_ref = bus.write_capture_trace(idx, "before", before_trace)
+        if after_trace:
+            trace_after_ref = bus.write_capture_trace(idx, "after", after_trace)
+
+        evidence = {
+            "schema_version": "evidence.v2",
+            "before_snapshot": before_ref,
+            "after_snapshot": after_ref,
+            "normalized_before": before_ref,
+            "normalized_after": after_ref,
+            "raw_tree_before": raw_before_ref,
+            "raw_tree_after": raw_after_ref,
+            "capture_trace_before": trace_before_ref,
+            "capture_trace_after": trace_after_ref,
+            "diff": diff_ref,
+            "before_tree_hash": before.get("tree_hash"),
+            "after_tree_hash": after.get("tree_hash"),
+            "capture_source_before": before.get("capture_source"),
+            "capture_source_after": after.get("capture_source"),
+            "diff_summary": {
+                "change_count": diff.get("change_count", 0),
+                "change_types": diff.get("change_types", []),
+            },
+        }
+        metadata = {
             "max_attempts": max(1, int(step.get("retries", 0)) + 1),
             "attempt_used": attempt,
+            "schema_version": after.get("schema_version"),
+            "bridge_protocol_version": after.get("normalization_report", {}).get("version")
+            if isinstance(after.get("normalization_report"), dict)
+            else None,
+            "app_integration_status": "error" if interact_result.get("bridge_error_code") else "ok",
         }
         if selector:
             metadata["selector"] = selector
@@ -115,7 +229,7 @@ def _run(platform: str, scenario: Scenario, run_dir: Path, dispatch_commands: bo
                 result=assertion_result,
                 step_index=idx,
                 evidence=evidence,
-                metadata={"selector": selector} if selector else None,
+                metadata={"selector": selector, **metadata} if selector else metadata,
             )
 
         step_results.append(
@@ -128,7 +242,7 @@ def _run(platform: str, scenario: Scenario, run_dir: Path, dispatch_commands: bo
             }
         )
 
-    bus.finalize(extra={"platform": platform, "schema_version": "run.v2", "dsl_version": scenario.dsl_version})
+    bus.finalize(extra={"platform": platform, "schema_version": "run.v3", "dsl_version": scenario.dsl_version})
     return {"steps": step_results}
 
 
@@ -154,6 +268,7 @@ def main() -> None:
     ended = datetime.now(timezone.utc)
     duration_seconds = (ended - started).total_seconds()
     meta = {
+        "schema_version": "run.v3",
         "run_id": run_id,
         "started_at": started.isoformat(),
         "ended_at": ended.isoformat(),

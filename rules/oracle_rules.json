@@ -3,6 +3,7 @@
   "require_assertion_action": true,
   "max_run_seconds": 180,
   "require_evidence_per_action": true,
+  "require_bridge_health_event": false,
   "max_selector_drift_rate": 0.5,
   "require_structural_change_for_actions": ["launch_app"],
   "replay_structural_consistency_threshold": 0.9

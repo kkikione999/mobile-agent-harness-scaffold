@@ -13,7 +13,7 @@ def create_failure_bundle(run_dir: Path) -> Path:
         "oracle_report.json",
         "replay_report.json",
     ]
-    include_dirs = ["snapshots", "diffs"]
+    include_dirs = ["snapshots", "diffs", "raw_trees", "capture_traces"]
 
     with tarfile.open(output, "w:gz") as tar:
         for name in include_files:

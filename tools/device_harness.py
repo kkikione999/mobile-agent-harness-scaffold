@@ -57,6 +57,7 @@ def cmd_open(args: argparse.Namespace) -> None:
         driver = IOSDriver(app=app, dispatch_commands=dispatch_commands)
 
     launch = driver.interact({"action": "launch_app"})
+    preflight = driver.preflight()
     session = {
         "platform": args.platform,
         "app": app,
@@ -64,7 +65,20 @@ def cmd_open(args: argparse.Namespace) -> None:
         "state": driver.dump_state(),
     }
     _save_session(Path(args.session_file), session)
-    print(json.dumps({"status": "ok", "operation": "open", "result": launch}, indent=2, ensure_ascii=True))
+    status = "ok"
+    if launch.get("status") in {"error", "fail"} or preflight.get("status") in {"error", "fail"}:
+        status = "error"
+    print(
+        json.dumps(
+            {
+                "status": status,
+                "operation": "open",
+                "result": {"launch": launch, "preflight": preflight},
+            },
+            indent=2,
+            ensure_ascii=True,
+        )
+    )
 
 
 def cmd_snapshot(args: argparse.Namespace) -> None:

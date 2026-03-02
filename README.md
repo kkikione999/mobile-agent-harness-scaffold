@@ -16,6 +16,7 @@ This repo gives you a minimal but runnable shape for:
 - `AGENTS.md`: AI contribution and review guardrails.
 - `config/`: Device and environment templates.
 - `docs/`: Architecture, oracle rules, and repro playbook.
+  - includes `android-bridge-contract.md` for app-side bridge integration.
 - `harness/`: Core runtime components.
 - `rules/`: Machine-checkable oracle thresholds.
 - `scenarios/`: Executable scenarios in DSL JSON.
@@ -40,7 +41,11 @@ make run-smoke-ios
 
 ## Current state
 
-This scaffold now emits per-step evidence artifacts (`snapshots/*.json`, `diffs/*.json`, `events.jsonl`) and evaluates runs using structural checks. iOS interactive control still uses a lightweight placeholder bridge by default; connect XCTest/WDA for production-grade interactions.
+This scaffold now emits per-step evidence artifacts (`snapshots/*.json`, `diffs/*.json`, `raw_trees/*.json`, `capture_traces/*.json`, `events.jsonl`) and evaluates runs using structural checks.
+
+Android dispatch mode (`DISPATCH_COMMANDS=1`) uses an accessibility bridge contract (`adb forward + HTTP`) for real UI tree capture (`cat.v2`). If the target app does not expose a ready bridge endpoint, the run hard-fails with explicit diagnostics (`bridge_not_integrated`).
+
+iOS interactive control still uses a lightweight placeholder bridge by default; connect XCTest/WDA for production-grade interactions.
 
 ## Unified CLI
 

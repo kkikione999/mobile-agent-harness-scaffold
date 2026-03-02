@@ -66,6 +66,16 @@ def _required_changes_satisfied(events: list[dict[str, Any]], required_actions: 
     return True
 
 
+def _bridge_health_event_present(events: list[dict[str, Any]]) -> bool:
+    for event in events:
+        if event.get("action") != "bridge_preflight":
+            continue
+        result = event.get("result", {})
+        if isinstance(result, dict) and result.get("status") == "ok":
+            return True
+    return False
+
+
 def _read_replay_score(run_dir: Path) -> float | None:
     replay_report = run_dir / "replay_report.json"
     if not replay_report.exists():
@@ -93,6 +103,7 @@ def evaluate(run_dir: Path, rules_path: Path) -> dict[str, Any]:
     replay_score = _read_replay_score(run_dir)
     replay_threshold = rules.get("replay_structural_consistency_threshold")
     max_selector_drift = float(rules.get("max_selector_drift_rate", 1.0))
+    require_bridge_health_event = bool(rules.get("require_bridge_health_event", False))
 
     checks = {
         "error_events_within_limit": len(error_events) <= int(rules.get("max_error_events", 0)),
@@ -101,6 +112,7 @@ def evaluate(run_dir: Path, rules_path: Path) -> dict[str, Any]:
         "evidence_complete_per_action": (not require_evidence_per_action) or _evidence_complete(events),
         "selector_drift_within_limit": selector_drift_rate <= max_selector_drift,
         "required_structural_changes_present": _required_changes_satisfied(events, required_change_actions),
+        "bridge_health_event_present": (not require_bridge_health_event) or _bridge_health_event_present(events),
     }
     if replay_threshold is not None:
         checks["replay_structural_consistency"] = replay_score is None or replay_score >= float(replay_threshold)

@@ -54,6 +54,22 @@ def _event_matches(event: dict[str, Any], filters: dict[str, str]) -> bool:
         if key == "error_code":
             if str(event.get("result", {}).get("error_code", "")) != value:
                 return False
+        if key == "bridge_error_code":
+            bridge_error = event.get("result", {}).get("bridge_error_code", "")
+            if str(bridge_error) != value:
+                return False
+        if key == "bridge_status":
+            bridge_status = event.get("result", {}).get("bridge_status", "")
+            if str(bridge_status) != value:
+                return False
+        if key == "schema_version":
+            schema_version = event.get("metadata", {}).get("schema_version", "")
+            if str(schema_version) != value:
+                return False
+        if key == "app_integration_status":
+            integration = event.get("metadata", {}).get("app_integration_status", "")
+            if str(integration) != value:
+                return False
     return True
 
 
@@ -81,6 +97,10 @@ def main() -> None:
                         "action": event.get("action"),
                         "status": event.get("result", {}).get("status"),
                         "error_code": event.get("result", {}).get("error_code"),
+                        "bridge_status": event.get("result", {}).get("bridge_status"),
+                        "bridge_error_code": event.get("result", {}).get("bridge_error_code"),
+                        "schema_version": event.get("metadata", {}).get("schema_version"),
+                        "app_integration_status": event.get("metadata", {}).get("app_integration_status"),
                         "resolved_ref": event.get("result", {}).get("selector_info", {}).get("resolved_ref"),
                     }
                 )

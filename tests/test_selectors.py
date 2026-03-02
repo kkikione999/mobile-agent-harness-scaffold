@@ -15,6 +15,10 @@ class TestSelectors(unittest.TestCase):
                 "type": "view",
                 "text": "",
                 "path": "0/1",
+                "resource_id": "home_screen",
+                "class_name": "android.view.View",
+                "content_desc": "home screen",
+                "bounds": [0, 0, 100, 100],
             }
         ]
         selector = {
@@ -26,6 +30,10 @@ class TestSelectors(unittest.TestCase):
                 "type": "view",
                 "text": "",
                 "path": "0/1",
+                "resource_id": "home_screen",
+                "class_name": "android.view.View",
+                "content_desc": "home screen",
+                "bounds": [0, 0, 100, 100],
             },
         }
 
@@ -33,6 +41,21 @@ class TestSelectors(unittest.TestCase):
         self.assertIsNotNone(matched)
         self.assertEqual(info["match_type"], "anchor")
         self.assertGreaterEqual(info["confidence"], 0.75)
+
+    def test_resource_id_selector(self) -> None:
+        elements = [
+            {
+                "ref": "@eaaa",
+                "id": "root",
+                "resource_id": "com.example:id/root",
+                "label": "Root",
+                "type": "android.view.View",
+                "path": "0",
+            }
+        ]
+        matched, info = resolve_selector({"by": "resource_id", "value": "com.example:id/root"}, elements)
+        self.assertIsNotNone(matched)
+        self.assertEqual(info["match_type"], "resource_id")
 
 
 if __name__ == "__main__":

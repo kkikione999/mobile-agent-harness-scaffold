@@ -20,7 +20,9 @@ class TestDeviceHarness(unittest.TestCase):
         verify = driver.verify({"action": "assert_visible", "target": "home_screen", "timeout_ms": 200})
 
         self.assertIn(launch_result["status"], {"ok", "recorded"})
+        self.assertEqual(before["schema_version"], "cat.v2")
         self.assertGreater(diff["change_count"], 0)
+        self.assertEqual(diff["schema_version"], "cat.diff.v2")
         self.assertEqual(verify["verdict"], "pass")
 
     def test_oracle_enforces_evidence_checks(self) -> None:
@@ -28,18 +30,18 @@ class TestDeviceHarness(unittest.TestCase):
             run_dir = Path(tmp)
             bus = EvidenceBus(run_dir=run_dir)
             sample_tree = {
-                "schema_version": "cat.v1",
+                "schema_version": "cat.v2",
                 "platform": "android",
                 "elements": [],
                 "tree_hash": "t1",
             }
             diff_payload = {
-                "schema_version": "cat.diff.v1",
+                "schema_version": "cat.diff.v2",
                 "before_tree_hash": "t1",
                 "after_tree_hash": "t2",
                 "change_count": 1,
                 "change_types": ["node_added"],
-                "changes": [{"type": "node_added", "ref": "@e1"}],
+                "changes": [{"type": "node_added", "ref": "@e1", "before": None, "after": {}, "source_fields": []}],
             }
             before_ref = bus.write_snapshot(0, "before", sample_tree)
             after_ref = bus.write_snapshot(0, "after", dict(sample_tree, tree_hash="t2"))

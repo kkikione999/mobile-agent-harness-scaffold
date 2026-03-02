@@ -20,6 +20,10 @@
    - `events.jsonl`
    - `snapshots/<step>-before.json`
    - `snapshots/<step>-after.json`
+   - `raw_trees/<step>-before.json`
+   - `raw_trees/<step>-after.json`
+   - `capture_traces/<step>-before.json`
+   - `capture_traces/<step>-after.json`
    - `diffs/<step>.json`
 7. `tools/evaluate_run.py` scores the run with oracle rules.
 8. `tools/replay_run.py` replays and computes structural consistency score.
@@ -32,3 +36,4 @@
 - Unknown or unsupported actions are explicit errors, not silent skips.
 - Element refs use deterministic anchors (`id/label/type/text/path`) with confidence-based fallback.
 - Replay validates structural consistency first (not pixel equality).
+- Android dispatch mode expects target-app bridge integration and emits hard-fail diagnostics when bridge health is not ready.

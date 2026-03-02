@@ -12,3 +12,4 @@ When a run fails:
    - exact command line used
 
 A valid repro package should contain at least `events.jsonl`, `summary.json`, `run_meta.json`, and `oracle_report.json`.
+For bridge-enabled runs, include `raw_trees/` and `capture_traces/` as part of the failure package.
