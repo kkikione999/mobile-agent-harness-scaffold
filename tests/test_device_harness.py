@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from harness.driver.android import AndroidDriver
 from harness.evidence.bus import EvidenceBus
@@ -24,6 +25,37 @@ class TestDeviceHarness(unittest.TestCase):
         self.assertGreater(diff["change_count"], 0)
         self.assertEqual(diff["schema_version"], "cat.diff.v2")
         self.assertEqual(verify["verdict"], "pass")
+
+    def test_selector_tap_uses_bounds_without_snapshot(self) -> None:
+        class CountingDriver(AndroidDriver):
+            def __init__(self, app: dict[str, str], dispatch_commands: bool) -> None:
+                super().__init__(app=app, dispatch_commands=dispatch_commands)
+                self.snapshot_calls = 0
+
+            def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
+                self.snapshot_calls += 1
+                return super().snapshot(options)
+
+        driver = CountingDriver(app={"android_package": "com.example.app"}, dispatch_commands=False)
+        elements = [
+            {
+                "ref": "@e123",
+                "id": "memo_button",
+                "label": "Memo",
+                "type": "view",
+                "text": "",
+                "path": "0/1",
+                "ordinal": 1,
+                "bounds": [10, 20, 110, 220],
+            }
+        ]
+        result = driver.interact(
+            {"action": "tap", "selector": {"by": "id", "value": "memo_button"}},
+            elements=elements,
+        )
+
+        self.assertEqual(driver.snapshot_calls, 0)
+        self.assertIn("input tap 60 120", result.get("command", ""))
 
     def test_oracle_enforces_evidence_checks(self) -> None:
         with tempfile.TemporaryDirectory(prefix="oracle-evidence-") as tmp:

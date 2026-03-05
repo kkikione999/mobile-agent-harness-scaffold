@@ -41,13 +41,17 @@ def _driver_for(platform: str, scenario: Scenario, dispatch_commands: bool) -> A
     raise ValueError(f"unsupported platform: {platform}")
 
 
-def _execute_with_retry(driver: AndroidDriver | IOSDriver, step: dict[str, Any]) -> tuple[dict[str, Any], int]:
+def _execute_with_retry(
+    driver: AndroidDriver | IOSDriver,
+    step: dict[str, Any],
+    elements: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], int]:
     retries = int(step.get("retries", 0))
     max_attempts = max(1, retries + 1)
     last_result: dict[str, Any] = {"status": "error", "details": "action did not run"}
 
     for attempt in range(1, max_attempts + 1):
-        result = driver.interact(step)
+        result = driver.interact(step, elements=elements)
         last_result = result
         if result.get("status") not in {"error", "fail"}:
             return result, attempt
@@ -154,7 +158,8 @@ def _run(platform: str, scenario: Scenario, run_dir: Path, dispatch_commands: bo
 
         before_full = driver.snapshot({"compact": True, "interactive_only": True})
         before, before_raw, before_trace = _extract_snapshot_artifacts(before_full)
-        interact_result, attempt = _execute_with_retry(driver, step)
+        selector_elements = before.get("elements", []) if step.get("selector") else None
+        interact_result, attempt = _execute_with_retry(driver, step, elements=selector_elements)
         after_full = driver.snapshot({"compact": True, "interactive_only": True})
         after, after_raw, after_trace = _extract_snapshot_artifacts(after_full)
         diff = driver.diff(before, after)

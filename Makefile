@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: check test run-smoke-android run-smoke-ios eval package-failure replay update-selectors query
+.PHONY: check test run-smoke-android run-smoke-ios eval package-failure replay update-selectors query mcp
 
 check:
 	$(PYTHON) tools/check_repo.py
@@ -34,3 +34,6 @@ update-selectors:
 query:
 	@if [ -z "$(QUERY)" ]; then echo "Usage: make query QUERY='action=tap success=false'"; exit 1; fi
 	$(PYTHON) tools/query_telemetry.py --query "$(QUERY)"
+
+mcp:
+	$(PYTHON) tools/mcp_server.py

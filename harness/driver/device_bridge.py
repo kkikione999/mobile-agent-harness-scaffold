@@ -170,15 +170,26 @@ class DeviceHarness(ABC):
             "changes": changes,
         }
 
-    def interact(self, action: dict[str, Any]) -> dict[str, Any]:
+    def interact(
+        self,
+        action: dict[str, Any],
+        *,
+        elements: list[dict[str, Any]] | None = None,
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         op = action.get("action", "")
-        command = self.command_for_action(action)
         selector = action.get("selector")
         selector_info: dict[str, Any] | None = None
+        resolved: dict[str, Any] | None = None
+        action_payload = dict(action)
 
         if selector:
-            current = self.snapshot()
-            resolved, info = resolve_selector(selector, current.get("elements", []))
+            if snapshot is None and elements is None:
+                snapshot = self.snapshot()
+            if elements is None and isinstance(snapshot, dict):
+                elements = snapshot.get("elements", [])
+
+            resolved, info = resolve_selector(selector, elements or [])
             selector_info = dict(info)
             if resolved is None:
                 return {
@@ -187,10 +198,36 @@ class DeviceHarness(ABC):
                     "error_code": "selector_drift",
                     "selector": selector,
                     "selector_info": selector_info,
-                    "command": command,
+                    "command": None,
                 }
             selector_info["resolved_ref"] = resolved.get("ref")
 
+        if op == "tap":
+            if "x" not in action_payload or "y" not in action_payload:
+                if resolved is None:
+                    return {
+                        "status": "error",
+                        "details": "tap requires x/y or a selector with bounds",
+                        "error_code": "missing_coordinates",
+                        "selector": selector,
+                        "selector_info": selector_info,
+                        "command": None,
+                    }
+                coords = self._center_from_bounds(resolved.get("bounds"))
+                if coords is None:
+                    return {
+                        "status": "error",
+                        "details": "tap selector did not resolve valid bounds",
+                        "error_code": "missing_coordinates",
+                        "selector": selector,
+                        "selector_info": selector_info,
+                        "command": None,
+                    }
+                action_payload["x"], action_payload["y"] = coords
+                if selector_info is not None:
+                    selector_info["tap_coordinates"] = {"x": action_payload["x"], "y": action_payload["y"]}
+
+        command = self.command_for_action(action_payload)
         if command is None:
             # Assertion actions are handled in verify() and don't dispatch a command.
             if op in {"assert_visible", "assert_eventually", "expect_transition"}:
@@ -199,7 +236,7 @@ class DeviceHarness(ABC):
 
         result = self._run_or_record(command)
         if result.get("status") not in {"error", "fail"}:
-            self._apply_state_transition(action)
+            self._apply_state_transition(action_payload)
         self._last_action = op
 
         if selector_info:
@@ -389,6 +426,18 @@ class DeviceHarness(ABC):
             node["anchor"] = build_anchor(node)
             nodes.append(node)
         return nodes
+
+    @staticmethod
+    def _center_from_bounds(bounds: Any) -> tuple[int, int] | None:
+        if not isinstance(bounds, list) or len(bounds) != 4:
+            return None
+        try:
+            left, top, right, bottom = [int(value) for value in bounds]
+        except (TypeError, ValueError):
+            return None
+        if right < left or bottom < top:
+            return None
+        return (left + right) // 2, (top + bottom) // 2
 
     @staticmethod
     def _tree_hash(elements: list[dict[str, Any]]) -> str:

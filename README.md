@@ -39,6 +39,48 @@ For iOS:
 make run-smoke-ios
 ```
 
+## MCP server
+
+This repo includes a stdio MCP server so AI clients can call harness tools directly.
+
+Run locally:
+
+```bash
+make mcp
+# or
+python3 tools/mcp_server.py
+```
+
+Exposed MCP tools include:
+- `run_scenario`
+- `evaluate_run`
+- `package_failure`
+- `replay_run`
+- `query_telemetry`
+- `update_selectors`
+- `device_open`
+- `device_snapshot`
+- `device_press`
+- `device_fill`
+- `device_verify`
+
+Notes for high-frequency `device_*` calls:
+- MCP server now executes `device_*` tools in-process with a cached session (no per-call Python subprocess spawn).
+- Optional `persist_session=true` writes session state to `session_file` for cross-process recovery.
+
+Example MCP client config (adjust absolute path):
+
+```json
+{
+  "mcpServers": {
+    "mobile-harness": {
+      "command": "python3",
+      "args": ["/Users/josh_folder/scaffold/tools/mcp_server.py"]
+    }
+  }
+}
+```
+
 ## Current state
 
 This scaffold now emits per-step evidence artifacts (`snapshots/*.json`, `diffs/*.json`, `raw_trees/*.json`, `capture_traces/*.json`, `events.jsonl`) and evaluates runs using structural checks.

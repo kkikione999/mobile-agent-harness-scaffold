@@ -1,0 +1,53 @@
+{
+  "name": "javis-memo-flow",
+  "dsl_version": "1.0",
+  "platform": "android",
+  "app": {
+    "android_package": "com.utell.youtiao"
+  },
+  "steps": [
+    {
+      "action": "tap",
+      "x": 330,
+      "y": 216,
+      "description": "点击 Memo 标签"
+    },
+    {
+      "action": "wait",
+      "seconds": 2,
+      "description": "等待页面加载"
+    },
+    {
+      "action": "tap",
+      "x": 959,
+      "y": 505,
+      "description": "点击 + 按钮"
+    },
+    {
+      "action": "wait",
+      "seconds": 2,
+      "description": "等待编辑页"
+    },
+    {
+      "action": "tap",
+      "x": 540,
+      "y": 300,
+      "description": "点击输入框"
+    },
+    {
+      "action": "wait",
+      "seconds": 1,
+      "description": "等待键盘"
+    },
+    {
+      "action": "input_text",
+      "text": "i am here",
+      "description": "输入文本"
+    },
+    {
+      "action": "wait",
+      "seconds": 1,
+      "description": "等待完成"
+    }
+  ]
+}

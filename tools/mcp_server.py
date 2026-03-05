@@ -1,0 +1,753 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+PROTOCOL_VERSION = "2024-11-05"
+SERVER_INFO = {"name": "mobile-agent-harness-mcp", "version": "0.1.0"}
+
+
+@dataclass
+class CommandResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+Runner = Callable[[list[str], Optional[dict[str, str]]], CommandResult]
+DEFAULT_SESSION_FILE = ".device_harness_session.json"
+
+
+@dataclass
+class DeviceSession:
+    platform: str
+    app: dict[str, Any]
+    dispatch_commands: bool
+    driver: Any
+
+
+DEVICE_SESSION_CACHE: dict[str, DeviceSession] = {}
+
+
+def _run_command(command: list[str], env_overrides: dict[str, str] | None = None) -> CommandResult:
+    env = dict(os.environ)
+    if env_overrides:
+        env.update(env_overrides)
+    proc = subprocess.run(command, capture_output=True, text=True, check=False, cwd=REPO_ROOT, env=env)
+    return CommandResult(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+
+def _line_after_prefix(text: str, prefix: str) -> str | None:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return stripped.replace(prefix, "", 1).strip()
+    return None
+
+
+def _maybe_json(text: str) -> Any | None:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _expect_str(arguments: dict[str, Any], key: str) -> str:
+    value = arguments.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"'{key}' must be a non-empty string")
+    return value
+
+
+def _optional_str(arguments: dict[str, Any], key: str) -> str | None:
+    value = arguments.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"'{key}' must be a non-empty string when provided")
+    return value
+
+
+def _optional_bool(arguments: dict[str, Any], key: str) -> bool | None:
+    value = arguments.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"'{key}' must be a boolean")
+    return value
+
+
+def _optional_int(arguments: dict[str, Any], key: str) -> int | None:
+    value = arguments.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"'{key}' must be an integer")
+    return value
+
+
+def _execute_script(
+    script_name: str,
+    script_args: list[str],
+    runner: Runner,
+    env_overrides: dict[str, str] | None = None,
+) -> tuple[CommandResult, dict[str, Any]]:
+    command = [sys.executable, str(REPO_ROOT / "tools" / script_name), *script_args]
+    result = runner(command, env_overrides)
+    payload = {
+        "command": command,
+        "env_overrides": env_overrides or {},
+        "exit_code": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+    return result, payload
+
+
+def _tool_run_scenario(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    scenario = _expect_str(arguments, "scenario")
+    platform = _expect_str(arguments, "platform")
+    run_root = _optional_str(arguments, "run_root")
+    dispatch_commands = _optional_bool(arguments, "dispatch_commands")
+
+    args = ["--scenario", scenario, "--platform", platform]
+    if run_root:
+        args.extend(["--run-root", run_root])
+
+    env_overrides = None
+    if dispatch_commands is not None:
+        env_overrides = {"DISPATCH_COMMANDS": "1" if dispatch_commands else "0"}
+
+    result, payload = _execute_script("run_scenario.py", args, runner, env_overrides=env_overrides)
+    payload["run_dir"] = _line_after_prefix(result.stdout, "run complete: ")
+    return result.returncode != 0, payload
+
+
+def _tool_evaluate_run(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    run_dir = _expect_str(arguments, "run_dir")
+    rules = _optional_str(arguments, "rules")
+
+    args = ["--run-dir", run_dir]
+    if rules:
+        args.extend(["--rules", rules])
+
+    result, payload = _execute_script("evaluate_run.py", args, runner)
+    payload["oracle_result"] = _line_after_prefix(result.stdout, "oracle result: ")
+    payload["report_path"] = _line_after_prefix(result.stdout, "report: ")
+    return result.returncode != 0, payload
+
+
+def _tool_package_failure(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    run_dir = _expect_str(arguments, "run_dir")
+    result, payload = _execute_script("package_failure.py", ["--run-dir", run_dir], runner)
+    payload["bundle_path"] = _line_after_prefix(result.stdout, "bundle: ")
+    return result.returncode != 0, payload
+
+
+def _tool_replay_run(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    run_dir = _expect_str(arguments, "run_dir")
+    mode = _optional_str(arguments, "mode")
+    run_root = _optional_str(arguments, "run_root")
+
+    args = ["--run-dir", run_dir]
+    if mode:
+        args.extend(["--mode", mode])
+    if run_root:
+        args.extend(["--run-root", run_root])
+
+    result, payload = _execute_script("replay_run.py", args, runner)
+    payload["replay_report_path"] = _line_after_prefix(result.stdout, "replay report: ")
+    payload["structural_consistency_score"] = _line_after_prefix(result.stdout, "structural consistency score: ")
+    return result.returncode != 0, payload
+
+
+def _tool_query_telemetry(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    query = _expect_str(arguments, "query")
+    run_root = _optional_str(arguments, "run_root")
+    limit = _optional_int(arguments, "limit")
+
+    args = ["--query", query]
+    if run_root:
+        args.extend(["--run-root", run_root])
+    if limit is not None:
+        args.extend(["--limit", str(limit)])
+
+    result, payload = _execute_script("query_telemetry.py", args, runner)
+    payload["query_result"] = _maybe_json(result.stdout)
+    return result.returncode != 0, payload
+
+
+def _tool_update_selectors(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    run_dir = _expect_str(arguments, "run_dir")
+    session = _optional_str(arguments, "session")
+    output = _optional_str(arguments, "output")
+
+    args = ["--run-dir", run_dir]
+    if session:
+        args.extend(["--session", session])
+    if output:
+        args.extend(["--output", output])
+
+    result, payload = _execute_script("update_selectors.py", args, runner)
+    payload["updated_session_path"] = _line_after_prefix(result.stdout, "updated session: ")
+    payload["selector_report_path"] = _line_after_prefix(result.stdout, "selector report: ")
+    return result.returncode != 0, payload
+
+
+def _normalize_session_path(session_file: str | None) -> Path:
+    candidate = Path(session_file) if session_file else Path(DEFAULT_SESSION_FILE)
+    candidate = candidate.expanduser()
+    if not candidate.is_absolute():
+        candidate = (REPO_ROOT / candidate).resolve()
+    return candidate
+
+
+def _build_device_driver(platform: str, app: dict[str, Any], dispatch_commands: bool) -> Any:
+    if platform == "android":
+        from harness.driver.android import AndroidDriver
+
+        return AndroidDriver(app=app, dispatch_commands=dispatch_commands)
+    if platform == "ios":
+        from harness.driver.ios import IOSDriver
+
+        return IOSDriver(app=app, dispatch_commands=dispatch_commands)
+    raise ValueError(f"unsupported platform: {platform}")
+
+
+def _selector_from_value(value: str, platform: str) -> dict[str, Any]:
+    from harness.driver.selectors import make_selector
+
+    by = "ref" if value.startswith("@e") else "id"
+    return make_selector(by=by, value=value, platform_hint=platform)
+
+
+def _load_session_from_file(path: Path) -> DeviceSession | None:
+    if not path.exists():
+        return None
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"invalid session payload at {path}")
+
+    platform = str(raw.get("platform", ""))
+    app = raw.get("app")
+    if not isinstance(app, dict):
+        raise ValueError(f"invalid session app at {path}")
+    dispatch_commands = bool(raw.get("dispatch_commands", False))
+    driver = _build_device_driver(platform, app, dispatch_commands)
+    state = raw.get("state", {})
+    if isinstance(state, dict):
+        driver.restore_state(state)
+    return DeviceSession(platform=platform, app=app, dispatch_commands=dispatch_commands, driver=driver)
+
+
+def _save_session_to_file(path: Path, session: DeviceSession) -> None:
+    payload = {
+        "platform": session.platform,
+        "app": session.app,
+        "dispatch_commands": session.dispatch_commands,
+        "state": session.driver.dump_state(),
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _device_context(arguments: dict[str, Any]) -> tuple[str, Path, bool, bool | None]:
+    session_file = _optional_str(arguments, "session_file")
+    persist_session = bool(_optional_bool(arguments, "persist_session") or False)
+    dispatch_override = _optional_bool(arguments, "dispatch_commands")
+    path = _normalize_session_path(session_file)
+    return str(path), path, persist_session, dispatch_override
+
+
+def _device_session(arguments: dict[str, Any], require_existing: bool = True) -> tuple[DeviceSession | None, str, Path, bool, bool | None]:
+    cache_key, session_path, persist_session, dispatch_override = _device_context(arguments)
+    session = DEVICE_SESSION_CACHE.get(cache_key)
+    if session is None:
+        restored = _load_session_from_file(session_path)
+        if restored is not None:
+            session = restored
+            DEVICE_SESSION_CACHE[cache_key] = restored
+
+    if session is None and require_existing:
+        raise ValueError(f"session not found: {session_path}; call device_open first")
+
+    if session is not None and dispatch_override is not None and dispatch_override != session.dispatch_commands:
+        raise ValueError("dispatch_commands mismatch with active session; reopen with device_open")
+
+    return session, cache_key, session_path, persist_session, dispatch_override
+
+
+def _tool_device_open(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    _ = runner
+    platform = _expect_str(arguments, "platform")
+    app_id = _expect_str(arguments, "app")
+    _, cache_key, session_path, persist_session, dispatch_override = _device_session(arguments, require_existing=False)
+
+    dispatch_commands = dispatch_override if dispatch_override is not None else os.getenv("DISPATCH_COMMANDS", "0") == "1"
+    if platform == "android":
+        app = {"android_package": app_id}
+    elif platform == "ios":
+        app = {"ios_bundle_id": app_id}
+    else:
+        raise ValueError(f"unsupported platform: {platform}")
+
+    driver = _build_device_driver(platform, app, dispatch_commands)
+    launch = driver.interact({"action": "launch_app"})
+    preflight = driver.preflight()
+
+    session = DeviceSession(platform=platform, app=app, dispatch_commands=dispatch_commands, driver=driver)
+    DEVICE_SESSION_CACHE[cache_key] = session
+    if persist_session:
+        _save_session_to_file(session_path, session)
+
+    status = "ok"
+    if launch.get("status") in {"error", "fail"} or preflight.get("status") in {"error", "fail"}:
+        status = "error"
+    result_json = {"status": status, "operation": "open", "result": {"launch": launch, "preflight": preflight}}
+
+    payload = {
+        "command": ["device_open"],
+        "env_overrides": {"DISPATCH_COMMANDS": "1" if dispatch_commands else "0"},
+        "exit_code": 0,
+        "stdout": json.dumps(result_json, ensure_ascii=True),
+        "stderr": "",
+        "result_json": result_json,
+        "session_file": str(session_path),
+        "persist_session": persist_session,
+    }
+    return status == "error", payload
+
+
+def _tool_device_snapshot(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    _ = runner
+    interactive = _optional_bool(arguments, "interactive")
+    compact = _optional_bool(arguments, "compact")
+    session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
+    assert session is not None
+
+    result_json = session.driver.snapshot({"interactive_only": bool(interactive), "compact": bool(compact)})
+    if persist_session:
+        _save_session_to_file(session_path, session)
+
+    payload = {
+        "command": ["device_snapshot"],
+        "env_overrides": {"DISPATCH_COMMANDS": "1" if session.dispatch_commands else "0"},
+        "exit_code": 0,
+        "stdout": json.dumps(result_json, ensure_ascii=True),
+        "stderr": "",
+        "result_json": result_json,
+        "session_file": str(session_path),
+        "persist_session": persist_session,
+    }
+    return False, payload
+
+
+def _tool_device_press(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    _ = runner
+    element = _expect_str(arguments, "element")
+    session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
+    assert session is not None
+
+    selector = _selector_from_value(element, session.platform)
+    result = session.driver.interact({"action": "tap", "selector": selector})
+    if persist_session:
+        _save_session_to_file(session_path, session)
+    result_json = {"status": "ok", "operation": "press", "result": result}
+
+    payload = {
+        "command": ["device_press", element],
+        "env_overrides": {"DISPATCH_COMMANDS": "1" if session.dispatch_commands else "0"},
+        "exit_code": 0,
+        "stdout": json.dumps(result_json, ensure_ascii=True),
+        "stderr": "",
+        "result_json": result_json,
+        "session_file": str(session_path),
+        "persist_session": persist_session,
+    }
+    return result.get("status") in {"error", "fail"}, payload
+
+
+def _tool_device_fill(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    _ = runner
+    element = _expect_str(arguments, "element")
+    text = _expect_str(arguments, "text")
+    session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
+    assert session is not None
+
+    selector = _selector_from_value(element, session.platform)
+    result = session.driver.interact({"action": "input_text", "selector": selector, "text": text})
+    if persist_session:
+        _save_session_to_file(session_path, session)
+    result_json = {"status": "ok", "operation": "fill", "result": result}
+
+    payload = {
+        "command": ["device_fill", element],
+        "env_overrides": {"DISPATCH_COMMANDS": "1" if session.dispatch_commands else "0"},
+        "exit_code": 0,
+        "stdout": json.dumps(result_json, ensure_ascii=True),
+        "stderr": "",
+        "result_json": result_json,
+        "session_file": str(session_path),
+        "persist_session": persist_session,
+    }
+    return result.get("status") in {"error", "fail"}, payload
+
+
+def _tool_device_verify(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    _ = runner
+    element = _expect_str(arguments, "element")
+    expected = _expect_str(arguments, "expected")
+    timeout_ms = _optional_int(arguments, "timeout_ms")
+    session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
+    assert session is not None
+
+    selector = _selector_from_value(element, session.platform)
+    assertion = {"action": "assert_visible", "selector": selector, "timeout_ms": timeout_ms or 5000, "value": expected}
+    result = session.driver.verify(assertion)
+    if persist_session:
+        _save_session_to_file(session_path, session)
+    result_json = {"status": "ok", "operation": "verify", "result": result}
+
+    payload = {
+        "command": ["device_verify", element],
+        "env_overrides": {"DISPATCH_COMMANDS": "1" if session.dispatch_commands else "0"},
+        "exit_code": 0,
+        "stdout": json.dumps(result_json, ensure_ascii=True),
+        "stderr": "",
+        "result_json": result_json,
+        "session_file": str(session_path),
+        "persist_session": persist_session,
+    }
+    return result.get("status") in {"error", "fail"} or result.get("verdict") == "fail", payload
+
+
+TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], Runner], tuple[bool, dict[str, Any]]]] = {
+    "run_scenario": _tool_run_scenario,
+    "evaluate_run": _tool_evaluate_run,
+    "package_failure": _tool_package_failure,
+    "replay_run": _tool_replay_run,
+    "query_telemetry": _tool_query_telemetry,
+    "update_selectors": _tool_update_selectors,
+    "device_open": _tool_device_open,
+    "device_snapshot": _tool_device_snapshot,
+    "device_press": _tool_device_press,
+    "device_fill": _tool_device_fill,
+    "device_verify": _tool_device_verify,
+}
+
+
+def tool_schemas() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "run_scenario",
+            "description": "Run a scenario JSON on Android or iOS and produce a run directory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scenario": {"type": "string"},
+                    "platform": {"type": "string", "enum": ["android", "ios"]},
+                    "run_root": {"type": "string"},
+                    "dispatch_commands": {"type": "boolean"},
+                },
+                "required": ["scenario", "platform"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "evaluate_run",
+            "description": "Evaluate a completed run with oracle rules.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"run_dir": {"type": "string"}, "rules": {"type": "string"}},
+                "required": ["run_dir"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "package_failure",
+            "description": "Create a failure bundle tarball from a run directory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"run_dir": {"type": "string"}},
+                "required": ["run_dir"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "replay_run",
+            "description": "Replay a run and compute structural consistency score.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_dir": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["structural"]},
+                    "run_root": {"type": "string"},
+                },
+                "required": ["run_dir"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "query_telemetry",
+            "description": "Search events in historical runs via key=value query filters.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "run_root": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "update_selectors",
+            "description": "Repair ref selectors in a scenario using latest snapshot from a run.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_dir": {"type": "string"},
+                    "session": {"type": "string"},
+                    "output": {"type": "string"},
+                },
+                "required": ["run_dir"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "device_open",
+            "description": "Open app in interactive device harness session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "platform": {"type": "string", "enum": ["android", "ios"]},
+                    "app": {"type": "string"},
+                    "session_file": {"type": "string"},
+                    "dispatch_commands": {"type": "boolean"},
+                    "persist_session": {"type": "boolean"},
+                },
+                "required": ["platform", "app"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "device_snapshot",
+            "description": "Capture compact accessibility snapshot from interactive session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_file": {"type": "string"},
+                    "interactive": {"type": "boolean"},
+                    "compact": {"type": "boolean"},
+                    "dispatch_commands": {"type": "boolean"},
+                    "persist_session": {"type": "boolean"},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "device_press",
+            "description": "Tap one element by id or @e reference in interactive session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "element": {"type": "string"},
+                    "session_file": {"type": "string"},
+                    "dispatch_commands": {"type": "boolean"},
+                    "persist_session": {"type": "boolean"},
+                },
+                "required": ["element"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "device_fill",
+            "description": "Input text into an element in interactive session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "element": {"type": "string"},
+                    "text": {"type": "string"},
+                    "session_file": {"type": "string"},
+                    "dispatch_commands": {"type": "boolean"},
+                    "persist_session": {"type": "boolean"},
+                },
+                "required": ["element", "text"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "device_verify",
+            "description": "Verify one element is visible in interactive session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "element": {"type": "string"},
+                    "expected": {"type": "string"},
+                    "timeout_ms": {"type": "integer"},
+                    "session_file": {"type": "string"},
+                    "dispatch_commands": {"type": "boolean"},
+                    "persist_session": {"type": "boolean"},
+                },
+                "required": ["element", "expected"],
+                "additionalProperties": False,
+            },
+        },
+    ]
+
+
+def execute_tool(name: str, arguments: dict[str, Any], runner: Runner = _run_command) -> tuple[bool, dict[str, Any]]:
+    handler = TOOL_HANDLERS.get(name)
+    if handler is None:
+        raise KeyError(f"unknown tool: {name}")
+    return handler(arguments, runner)
+
+
+def _error(code: int, message: str, request_id: Any = None) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+def _response(result: dict[str, Any], request_id: Any) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+class MCPServer:
+    def __init__(self, runner: Runner = _run_command):
+        self._runner = runner
+
+    def handle_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
+        request_id = message.get("id")
+        method = message.get("method")
+        if not isinstance(method, str):
+            return _error(-32600, "invalid request: missing method", request_id)
+
+        if method == "notifications/initialized":
+            return None
+        if method == "ping":
+            return _response({}, request_id)
+        if method == "initialize":
+            params = message.get("params", {})
+            protocol_version = PROTOCOL_VERSION
+            if isinstance(params, dict):
+                client_protocol = params.get("protocolVersion")
+                if isinstance(client_protocol, str) and client_protocol:
+                    protocol_version = client_protocol
+            return _response(
+                {
+                    "protocolVersion": protocol_version,
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": SERVER_INFO,
+                },
+                request_id,
+            )
+        if method == "tools/list":
+            return _response({"tools": tool_schemas()}, request_id)
+        if method == "resources/list":
+            return _response({"resources": []}, request_id)
+        if method == "prompts/list":
+            return _response({"prompts": []}, request_id)
+        if method == "tools/call":
+            params = message.get("params", {})
+            if not isinstance(params, dict):
+                return _error(-32602, "invalid params for tools/call", request_id)
+            name = params.get("name")
+            if not isinstance(name, str) or not name:
+                return _error(-32602, "tool name is required", request_id)
+            arguments = params.get("arguments", {})
+            if arguments is None:
+                arguments = {}
+            if not isinstance(arguments, dict):
+                return _error(-32602, "tool arguments must be an object", request_id)
+
+            try:
+                is_error, payload = execute_tool(name, arguments, runner=self._runner)
+            except KeyError:
+                return _error(-32602, f"unknown tool: {name}", request_id)
+            except ValueError as exc:
+                return _error(-32602, str(exc), request_id)
+            except Exception as exc:  # pragma: no cover - defensive path
+                return _error(-32000, f"tool execution failed: {exc}", request_id)
+
+            body = json.dumps(payload, indent=2, ensure_ascii=True)
+            return _response(
+                {
+                    "content": [{"type": "text", "text": body}],
+                    "structuredContent": payload,
+                    "isError": is_error,
+                },
+                request_id,
+            )
+
+        return _error(-32601, f"method not found: {method}", request_id)
+
+
+def _read_message(input_stream: Any) -> dict[str, Any] | None:
+    headers: dict[str, str] = {}
+    while True:
+        line = input_stream.readline()
+        if line == b"":
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        raw = line.decode("ascii", errors="replace").strip()
+        if ":" not in raw:
+            continue
+        key, value = raw.split(":", 1)
+        headers[key.strip().lower()] = value.strip()
+
+    content_length = int(headers.get("content-length", "0"))
+    if content_length <= 0:
+        raise ValueError("missing content-length header")
+    body = input_stream.read(content_length)
+    if len(body) != content_length:
+        raise ValueError("incomplete message body")
+    return json.loads(body.decode("utf-8"))
+
+
+def _write_message(output_stream: Any, payload: dict[str, Any]) -> None:
+    body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+    output_stream.write(header)
+    output_stream.write(body)
+    output_stream.flush()
+
+
+def serve_forever(server: MCPServer) -> None:
+    while True:
+        try:
+            message = _read_message(sys.stdin.buffer)
+        except json.JSONDecodeError:
+            _write_message(sys.stdout.buffer, _error(-32700, "parse error", None))
+            continue
+        except ValueError as exc:
+            _write_message(sys.stdout.buffer, _error(-32600, str(exc), None))
+            continue
+
+        if message is None:
+            return
+        if not isinstance(message, dict):
+            _write_message(sys.stdout.buffer, _error(-32600, "invalid request payload", None))
+            continue
+
+        response = server.handle_message(message)
+        if response is not None and message.get("id") is not None:
+            _write_message(sys.stdout.buffer, response)
+
+
+def main() -> None:
+    serve_forever(MCPServer())
+
+
+if __name__ == "__main__":
+    main()

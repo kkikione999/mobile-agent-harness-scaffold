@@ -24,8 +24,7 @@ class IOSDriver(DeviceHarness):
         if op == "tap":
             if "x" in action and "y" in action:
                 return f"xcrun simctl io booted tap {int(action['x'])} {int(action['y'])}"
-            # Placeholder command that preserves deterministic traces without requiring XCTest bridge.
-            return "xcrun simctl getenv booted SIMULATOR_UDID"
+            return None
 
         if op == "input_text":
             text = shlex.quote(str(action.get("text", "")))

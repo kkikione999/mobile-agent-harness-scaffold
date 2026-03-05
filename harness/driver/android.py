@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import shlex
+import subprocess
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Any
 
@@ -38,6 +40,12 @@ class AndroidDriver(DeviceHarness):
         if not self.dispatch_commands:
             return super().snapshot(options)
 
+        # Try ADB uiautomator first
+        adb_capture = self._adb_snapshot()
+        if adb_capture.get("status") == "ok":
+            return self._normalize_adb_snapshot(adb_capture)
+
+        # Fallback to bridge
         capture = self._bridge.snapshot(app_package=self.app_identity(), options=options)
         if capture.get("status") != "ok":
             fallback = super().snapshot(options)
@@ -57,6 +65,146 @@ class AndroidDriver(DeviceHarness):
 
         return self._normalize_bridge_snapshot(capture)
 
+    def _adb_prefix(self) -> list[str]:
+        prefix = ["adb"]
+        serial = os.getenv("ANDROID_SERIAL")
+        if serial:
+            prefix.extend(["-s", serial])
+        return prefix
+
+    def _adb_snapshot(self) -> dict[str, Any]:
+        """Capture UI snapshot using ADB uiautomator."""
+        try:
+            # Dump UI hierarchy to file
+            dump_result = subprocess.run(
+                self._adb_prefix() + ["shell", "uiautomator", "dump", "/sdcard/window_dump.xml"],
+                capture_output=True, text=True, timeout=10
+            )
+            if dump_result.returncode != 0:
+                return {"status": "error", "error_code": "adb_dump_failed", "details": dump_result.stderr}
+
+            # Read the dump file
+            cat_result = subprocess.run(
+                self._adb_prefix() + ["shell", "cat", "/sdcard/window_dump.xml"],
+                capture_output=True, text=True, timeout=10
+            )
+            if cat_result.returncode != 0:
+                return {"status": "error", "error_code": "adb_cat_failed", "details": cat_result.stderr}
+
+            # Parse XML
+            xml_content = cat_result.stdout
+            if not xml_content or "<hierarchy" not in xml_content:
+                return {"status": "error", "error_code": "empty_xml", "details": "No XML content returned"}
+
+            return {
+                "status": "ok",
+                "xml": xml_content,
+                "request_id": "adb-snapshot",
+            }
+        except subprocess.TimeoutExpired:
+            return {"status": "error", "error_code": "adb_timeout", "details": "ADB command timed out"}
+        except Exception as e:
+            return {"status": "error", "error_code": "adb_exception", "details": str(e)}
+
+    def _normalize_adb_snapshot(self, capture: dict[str, Any]) -> dict[str, Any]:
+        """Normalize ADB uiautomator snapshot to cat.v2 format."""
+        xml_content = capture.get("xml", "")
+
+        try:
+            root = ET.fromstring(xml_content)
+        except ET.ParseError as e:
+            return {
+                "schema_version": "cat.v2",
+                "platform": self.platform,
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "root": "root",
+                "elements": [],
+                "capture_source": "adb_parse_error",
+                "capture_error": {"error_code": "xml_parse_error", "details": str(e)},
+            }
+
+        elements = []
+        node_index = 0
+
+        def parse_bounds(bounds_str: str) -> list[int]:
+            """Parse bounds string [left,top][right,bottom] to list."""
+            try:
+                parts = bounds_str.replace("[", ",").replace("]", ",").split(",")
+                nums = [int(p) for p in parts if p.strip()]
+                if len(nums) >= 4:
+                    return nums[:4]
+            except:
+                pass
+            return [0, 0, 0, 0]
+
+        def traverse(node: ET.Element, path: str, depth: int) -> None:
+            nonlocal node_index
+
+            bounds = parse_bounds(node.get("bounds", ""))
+            text = node.get("text", "")
+            resource_id = node.get("resource-id", "")
+            class_name = node.get("class", "android.view.View")
+            content_desc = node.get("content-desc", "")
+            clickable = node.get("clickable", "false") == "true"
+            enabled = node.get("enabled", "true") != "false"
+            visible = node.get("visible-to-user", "true") != "false"
+            focusable = node.get("focusable", "false") == "true"
+            checked = node.get("checked", "false") == "true"
+            selected = node.get("selected", "false") == "true"
+            editable = "Edit" in class_name
+
+            label = content_desc or text or resource_id or class_name
+            interactive = clickable or focusable or editable
+
+            element = {
+                "id": resource_id or f"node-{node_index}",
+                "label": label,
+                "type": class_name,
+                "text": text,
+                "path": path,
+                "ordinal": node_index,
+                "interactive": interactive,
+                "class_name": class_name,
+                "resource_id": resource_id,
+                "content_desc": content_desc,
+                "bounds": bounds,
+                "clickable": clickable,
+                "enabled": enabled,
+                "visible": visible,
+                "focusable": focusable,
+                "checked": checked,
+                "selected": selected,
+                "editable": editable,
+                "depth": depth,
+                "index_in_parent": node_index,
+                "source_node_id": f"node-{node_index}",
+            }
+            element["ref"] = build_ref(self.platform, element)
+            element["anchor"] = build_anchor(element)
+            elements.append(element)
+
+            node_index += 1
+
+            for idx, child in enumerate(node):
+                traverse(child, f"{path}/{idx}", depth + 1)
+
+        # Start traversal from hierarchy root
+        for idx, child in enumerate(root):
+            traverse(child, f"0/{idx}", 0)
+
+        return {
+            "schema_version": "cat.v2",
+            "platform": self.platform,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "root": elements[0]["ref"] if elements else "root",
+            "elements": elements,
+            "tree_hash": self._tree_hash(elements),
+            "element_map": {el["id"]: el["ref"] for el in elements if el.get("id")},
+            "capture_source": "adb_uiautomator",
+            "source_request_id": capture.get("request_id"),
+            "capture_trace": {"adb_dump": "success"},
+        }
+
     def command_for_action(self, action: dict[str, Any]) -> str | None:
         op = action.get("action")
         package = str(self.app.get("android_package", ""))
@@ -67,10 +215,13 @@ class AndroidDriver(DeviceHarness):
         if op == "tap":
             if "x" in action and "y" in action:
                 return f"adb shell input tap {int(action['x'])} {int(action['y'])}"
-            return "adb shell input tap 100 200"
+            return None
 
         if op == "input_text":
-            text = shlex.quote(str(action.get("text", "")))
+            text = str(action.get("text", ""))
+            # ADB input text uses %s for spaces
+            text = text.replace(" ", "%s")
+            text = shlex.quote(text)
             return f"adb shell input text {text}"
 
         if op == "swipe":
@@ -88,8 +239,14 @@ class AndroidDriver(DeviceHarness):
 
         return None
 
-    def interact(self, action: dict[str, Any]) -> dict[str, Any]:
-        result = super().interact(action)
+    def interact(
+        self,
+        action: dict[str, Any],
+        *,
+        elements: list[dict[str, Any]] | None = None,
+        snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = super().interact(action, elements=elements, snapshot=snapshot)
         if not self.dispatch_commands:
             return result
 
