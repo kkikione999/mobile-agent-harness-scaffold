@@ -65,12 +65,44 @@ def _anchor_score(anchor: dict[str, Any], node: dict[str, Any]) -> float:
     return score
 
 
+def _scope_elements_within(
+    selector: dict[str, Any],
+    elements: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    within = selector.get("within")
+    if not within:
+        return elements, None
+
+    within_value = str(within)
+    if within_value.startswith("@e"):
+        within_element = next((el for el in elements if el.get("ref") == within_value), None)
+    else:
+        within_element = next((el for el in elements if str(el.get("id", "")) == within_value), None)
+
+    if not within_element:
+        return [], {"candidate_count": 0, "confidence": 0.0, "match_type": "not_found"}
+
+    within_path = str(within_element.get("path", ""))
+    if not within_path:
+        return [], {"candidate_count": 0, "confidence": 0.0, "match_type": "not_found"}
+
+    prefix = f"{within_path}/"
+    scoped = [el for el in elements if str(el.get("path", "")).startswith(prefix)]
+    return scoped, None
+
+
 def resolve_selector(
     selector: dict[str, Any],
     elements: list[dict[str, Any]],
     *,
     score_threshold: float = 0.75,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    elements, scope_info = _scope_elements_within(selector, elements)
+    if scope_info is not None:
+        return None, scope_info
+    if selector.get("within") and not elements:
+        return None, {"candidate_count": 0, "confidence": 0.0, "match_type": "not_found"}
+
     by = selector.get("by")
     value = str(selector.get("value", ""))
     candidates: list[dict[str, Any]]
