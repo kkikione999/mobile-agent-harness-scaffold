@@ -42,6 +42,7 @@
     {
       "action": "input_text",
       "text": "i am here",
+      "target": "memo_input",
       "description": "输入文本"
     },
     {
