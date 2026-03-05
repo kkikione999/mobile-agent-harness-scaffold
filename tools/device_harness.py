@@ -41,6 +41,20 @@ def _build_driver(session: dict[str, Any]) -> AndroidDriver | IOSDriver:
     return driver
 
 
+_LIST_FIELDS = ("id", "label", "ref", "resource_id", "text", "bounds", "path")
+
+
+def _compact_elements(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    elements = snapshot.get("elements", [])
+    if not isinstance(elements, list):
+        return []
+    compact: list[dict[str, Any]] = []
+    for element in elements:
+        if isinstance(element, dict):
+            compact.append({field: element.get(field) for field in _LIST_FIELDS})
+    return compact
+
+
 def _selector_from_value(value: str, platform: str) -> dict[str, Any]:
     if value.startswith("@e"):
         return make_selector(by="ref", value=value, platform_hint=platform)
@@ -90,6 +104,18 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
     session["state"] = driver.dump_state()
     _save_session(Path(args.session_file), session)
     print(json.dumps(snapshot, indent=2, ensure_ascii=True))
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    session = _load_session(Path(args.session_file))
+    if not session:
+        raise SystemExit(f"session not found: {args.session_file}")
+    driver = _build_driver(session)
+    snapshot = driver.snapshot({"interactive_only": True, "compact": True})
+    session["state"] = driver.dump_state()
+    _save_session(Path(args.session_file), session)
+    elements = _compact_elements(snapshot)
+    print(json.dumps(elements, indent=2, ensure_ascii=True))
 
 
 def cmd_press(args: argparse.Namespace) -> None:
@@ -148,6 +174,9 @@ def main() -> None:
     snapshot_parser.add_argument("-i", "--interactive", action="store_true")
     snapshot_parser.add_argument("-c", "--compact", action="store_true")
     snapshot_parser.set_defaults(func=cmd_snapshot)
+
+    list_parser = sub.add_parser("list", help="List selector-friendly elements from snapshot.")
+    list_parser.set_defaults(func=cmd_list)
 
     press_parser = sub.add_parser("press", help="Tap a referenced element.")
     press_parser.add_argument("element", help="@e ref or element id")

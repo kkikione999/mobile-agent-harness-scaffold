@@ -231,6 +231,20 @@ def _selector_from_value(value: str, platform: str) -> dict[str, Any]:
     return make_selector(by=by, value=value, platform_hint=platform)
 
 
+_LIST_FIELDS = ("id", "label", "ref", "resource_id", "text", "bounds", "path")
+
+
+def _compact_elements(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    elements = snapshot.get("elements", [])
+    if not isinstance(elements, list):
+        return []
+    compact: list[dict[str, Any]] = []
+    for element in elements:
+        if isinstance(element, dict):
+            compact.append({field: element.get(field) for field in _LIST_FIELDS})
+    return compact
+
+
 def _load_session_from_file(path: Path) -> DeviceSession | None:
     if not path.exists():
         return None
@@ -351,6 +365,29 @@ def _tool_device_snapshot(arguments: dict[str, Any], runner: Runner) -> tuple[bo
     return False, payload
 
 
+def _tool_device_list(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    _ = runner
+    session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
+    assert session is not None
+
+    snapshot = session.driver.snapshot({"interactive_only": True, "compact": True})
+    elements = _compact_elements(snapshot)
+    if persist_session:
+        _save_session_to_file(session_path, session)
+
+    payload = {
+        "command": ["device_list"],
+        "env_overrides": {"DISPATCH_COMMANDS": "1" if session.dispatch_commands else "0"},
+        "exit_code": 0,
+        "stdout": json.dumps(elements, ensure_ascii=True),
+        "stderr": "",
+        "result_json": elements,
+        "session_file": str(session_path),
+        "persist_session": persist_session,
+    }
+    return False, payload
+
+
 def _tool_device_press(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
     _ = runner
     element = _expect_str(arguments, "element")
@@ -439,6 +476,7 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], Runner], tuple[bool, dict[str
     "update_selectors": _tool_update_selectors,
     "device_open": _tool_device_open,
     "device_snapshot": _tool_device_snapshot,
+    "device_list": _tool_device_list,
     "device_press": _tool_device_press,
     "device_fill": _tool_device_fill,
     "device_verify": _tool_device_verify,
@@ -549,6 +587,20 @@ def tool_schemas() -> list[dict[str, Any]]:
                     "session_file": {"type": "string"},
                     "interactive": {"type": "boolean"},
                     "compact": {"type": "boolean"},
+                    "dispatch_commands": {"type": "boolean"},
+                    "persist_session": {"type": "boolean"},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "device_list",
+            "description": "List selector-friendly elements from the interactive session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_file": {"type": "string"},
                     "dispatch_commands": {"type": "boolean"},
                     "persist_session": {"type": "boolean"},
                 },
