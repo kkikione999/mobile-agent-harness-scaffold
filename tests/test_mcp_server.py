@@ -40,6 +40,7 @@ class TestMCPServer(unittest.TestCase):
         self.assertIn("run_scenario", names)
         self.assertIn("evaluate_run", names)
         self.assertIn("device_open", names)
+        self.assertIn("device_list", names)
 
     def test_run_scenario_tool_call_maps_to_script_and_parses_run_dir(self) -> None:
         runner = _FakeRunner(
@@ -126,6 +127,22 @@ class TestMCPServer(unittest.TestCase):
             self.assertIsNotNone(snapshot_response)
             snapshot = snapshot_response["result"]["structuredContent"]["result_json"]  # type: ignore[index]
             self.assertEqual(snapshot["schema_version"], "cat.v2")
+
+            list_response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 215,
+                    "method": "tools/call",
+                    "params": {"name": "device_list", "arguments": {"session_file": session_file}},
+                }
+            )
+            self.assertIsNotNone(list_response)
+            elements = list_response["result"]["structuredContent"]["result_json"]  # type: ignore[index]
+            self.assertIsInstance(elements, list)
+            self.assertTrue(elements)
+            for field in ("id", "label", "ref", "resource_id", "text", "bounds", "path"):
+                self.assertIn(field, elements[0])
+            self.assertTrue(any(el.get("id") == "search_box" for el in elements))
 
             fill_response = server.handle_message(
                 {
