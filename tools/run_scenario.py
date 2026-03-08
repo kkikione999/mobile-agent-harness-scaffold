@@ -160,8 +160,14 @@ def _run(platform: str, scenario: Scenario, run_dir: Path, dispatch_commands: bo
         before, before_raw, before_trace = _extract_snapshot_artifacts(before_full)
         selector_elements = before.get("elements", []) if step.get("selector") else None
         interact_result, attempt = _execute_with_retry(driver, step, elements=selector_elements)
-        after_full = driver.snapshot({"compact": True, "interactive_only": True})
-        after, after_raw, after_trace = _extract_snapshot_artifacts(after_full)
+        reuse_fixed_snapshot = step["action"] in ASSERTION_ACTIONS and interact_result.get("command") is None
+        if reuse_fixed_snapshot:
+            after = dict(before)
+            after_raw = before_raw
+            after_trace = before_trace
+        else:
+            after_full = driver.snapshot({"compact": True, "interactive_only": True})
+            after, after_raw, after_trace = _extract_snapshot_artifacts(after_full)
         diff = driver.diff(before, after)
 
         assertion_result: dict[str, Any] | None = None
@@ -169,7 +175,7 @@ def _run(platform: str, scenario: Scenario, run_dir: Path, dispatch_commands: bo
             assertion_result = driver.verify(step)
 
         before_ref = bus.write_snapshot(idx, "before", before)
-        after_ref = bus.write_snapshot(idx, "after", after)
+        after_ref = before_ref if reuse_fixed_snapshot else bus.write_snapshot(idx, "after", after)
         diff_ref = bus.write_diff(idx, diff)
         raw_before_ref = None
         raw_after_ref = None
@@ -177,11 +183,15 @@ def _run(platform: str, scenario: Scenario, run_dir: Path, dispatch_commands: bo
         trace_after_ref = None
         if isinstance(before_raw, (dict, list)):
             raw_before_ref = bus.write_raw_tree(idx, "before", before_raw)
-        if isinstance(after_raw, (dict, list)):
+        if reuse_fixed_snapshot:
+            raw_after_ref = raw_before_ref
+        elif isinstance(after_raw, (dict, list)):
             raw_after_ref = bus.write_raw_tree(idx, "after", after_raw)
         if before_trace:
             trace_before_ref = bus.write_capture_trace(idx, "before", before_trace)
-        if after_trace:
+        if reuse_fixed_snapshot:
+            trace_after_ref = trace_before_ref
+        elif after_trace:
             trace_after_ref = bus.write_capture_trace(idx, "after", after_trace)
 
         evidence = {
