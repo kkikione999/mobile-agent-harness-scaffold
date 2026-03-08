@@ -248,6 +248,9 @@ class DeviceHarness(ABC):
         timeout_ms = int(assertion.get("timeout_ms", assertion.get("timeout", 0) * 1000 or 5000))
         poll_ms = int(assertion.get("poll_ms", 250))
         elapsed = 0
+        expected_value = assertion.get("value")
+        expected_text = "" if expected_value is None else str(expected_value)
+        last_actual: str | None = None
 
         while True:
             snapshot = self.snapshot()
@@ -262,19 +265,31 @@ class DeviceHarness(ABC):
                 target, selector_info = resolve_selector(selector, elements)
 
             if target is not None:
-                expected = assertion.get("value", assertion.get("target", selector.get("value") if selector else ""))
-                actual = target.get("text") or target.get("label") or target.get("id")
-                return {
-                    "status": "ok",
-                    "verdict": "pass",
-                    "expected": expected,
-                    "actual": actual,
-                    "selector": selector,
-                    "selector_info": selector_info,
-                    "snapshot_tree_hash": snapshot.get("tree_hash"),
-                }
+                actual = self._primary_actual(target)
+                last_actual = actual
+                if self._expectation_satisfied(target, expected_text):
+                    return {
+                        "status": "ok",
+                        "verdict": "pass",
+                        "expected": expected_text or "visible",
+                        "actual": actual,
+                        "selector": selector,
+                        "selector_info": selector_info,
+                        "snapshot_tree_hash": snapshot.get("tree_hash"),
+                    }
 
             if elapsed >= timeout_ms:
+                if target is not None:
+                    return {
+                        "status": "fail",
+                        "verdict": "fail",
+                        "error_code": "assertion_mismatch",
+                        "details": "assertion expected value did not match resolved element",
+                        "expected": expected_text or "visible",
+                        "actual": last_actual,
+                        "selector": selector,
+                        "elapsed_ms": elapsed,
+                    }
                 return {
                     "status": "fail",
                     "verdict": "fail",
@@ -448,3 +463,33 @@ class DeviceHarness(ABC):
             ]
         )
         return build_ref("tree", {"id": material, "label": "", "type": "", "path": "", "ordinal": 0})
+
+    @staticmethod
+    def _is_presence_expectation(expected: str) -> bool:
+        normalized = expected.strip().lower()
+        return normalized in {"", "visible", "exists", "present"}
+
+    def _expectation_satisfied(self, target: dict[str, Any], expected: str) -> bool:
+        if self._is_presence_expectation(expected):
+            return True
+        for candidate in self._actual_candidates(target):
+            if candidate == expected:
+                return True
+        return False
+
+    @staticmethod
+    def _actual_candidates(target: dict[str, Any]) -> list[str]:
+        fields = ("text", "label", "id", "content_desc", "resource_id", "class_name", "type")
+        candidates: list[str] = []
+        for field in fields:
+            value = target.get(field)
+            if value is None:
+                continue
+            text = str(value)
+            if text:
+                candidates.append(text)
+        return candidates
+
+    def _primary_actual(self, target: dict[str, Any]) -> str:
+        candidates = self._actual_candidates(target)
+        return candidates[0] if candidates else ""

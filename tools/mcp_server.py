@@ -936,19 +936,51 @@ class MCPServer:
         return _error(-32601, f"method not found: {method}", request_id)
 
 
-def _read_message(input_stream: Any) -> dict[str, Any] | None:
+def _read_message(input_stream: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """
+    Read one MCP message from stdin.
+
+    Supports both:
+    - Header-framed transport (Content-Length + JSON body)
+    - JSONL transport (one JSON object per line)
+    """
     headers: dict[str, str] = {}
+
     while True:
         line = input_stream.readline()
         if line == b"":
-            return None
+            return None, None
+
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # JSONL mode: line is already a complete JSON-RPC message.
+        if stripped.startswith(b"{") or stripped.startswith(b"["):
+            return json.loads(stripped.decode("utf-8")), "jsonl"
+
+        raw = line.decode("ascii", errors="replace").strip()
+        if ":" not in raw:
+            # Ignore unknown prelude lines and keep reading.
+            continue
+
+        key, value = raw.split(":", 1)
+        normalized_key = key.strip().lower().lstrip("\ufeff")
+        headers[normalized_key] = value.strip()
+        break
+
+    while True:
+        line = input_stream.readline()
+        if line == b"":
+            raise ValueError("incomplete message headers")
         if line in (b"\r\n", b"\n"):
             break
         raw = line.decode("ascii", errors="replace").strip()
         if ":" not in raw:
             continue
         key, value = raw.split(":", 1)
-        headers[key.strip().lower()] = value.strip()
+        normalized_key = key.strip().lower().lstrip("\ufeff")
+        headers[normalized_key] = value.strip()
 
     content_length = int(headers.get("content-length", "0"))
     if content_length <= 0:
@@ -956,11 +988,16 @@ def _read_message(input_stream: Any) -> dict[str, Any] | None:
     body = input_stream.read(content_length)
     if len(body) != content_length:
         raise ValueError("incomplete message body")
-    return json.loads(body.decode("utf-8"))
+    return json.loads(body.decode("utf-8")), "lsp"
 
 
-def _write_message(output_stream: Any, payload: dict[str, Any]) -> None:
+def _write_message(output_stream: Any, payload: dict[str, Any], transport_mode: str = "lsp") -> None:
     body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    if transport_mode == "jsonl":
+        output_stream.write(body + b"\n")
+        output_stream.flush()
+        return
+
     header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
     output_stream.write(header)
     output_stream.write(body)
@@ -968,25 +1005,32 @@ def _write_message(output_stream: Any, payload: dict[str, Any]) -> None:
 
 
 def serve_forever(server: MCPServer) -> None:
+    transport_mode = "lsp"
     while True:
         try:
-            message = _read_message(sys.stdin.buffer)
+            message, detected_mode = _read_message(sys.stdin.buffer)
+            if detected_mode:
+                transport_mode = detected_mode
         except json.JSONDecodeError:
-            _write_message(sys.stdout.buffer, _error(-32700, "parse error", None))
+            _write_message(sys.stdout.buffer, _error(-32700, "parse error", None), transport_mode=transport_mode)
             continue
         except ValueError as exc:
-            _write_message(sys.stdout.buffer, _error(-32600, str(exc), None))
+            _write_message(sys.stdout.buffer, _error(-32600, str(exc), None), transport_mode=transport_mode)
             continue
 
         if message is None:
             return
         if not isinstance(message, dict):
-            _write_message(sys.stdout.buffer, _error(-32600, "invalid request payload", None))
+            _write_message(
+                sys.stdout.buffer,
+                _error(-32600, "invalid request payload", None),
+                transport_mode=transport_mode,
+            )
             continue
 
         response = server.handle_message(message)
         if response is not None and message.get("id") is not None:
-            _write_message(sys.stdout.buffer, response)
+            _write_message(sys.stdout.buffer, response, transport_mode=transport_mode)
 
 
 def main() -> None:

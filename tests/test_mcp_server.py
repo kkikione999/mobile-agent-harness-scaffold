@@ -235,6 +235,62 @@ class TestMCPServer(unittest.TestCase):
             self.assertIsNotNone(snapshot_response)
             self.assertFalse(snapshot_response["result"]["isError"])  # type: ignore[index]
 
+    def test_device_verify_mismatch_is_reported_as_error(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mcp-device-verify-mismatch-") as tmp:
+            session_file = str(Path(tmp) / "session.json")
+            server = mcp_server.MCPServer(runner=_FailRunner())
+            open_response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 40,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "device_open",
+                        "arguments": {
+                            "platform": "android",
+                            "app": "com.example.app",
+                            "dispatch_commands": False,
+                            "session_file": session_file,
+                        },
+                    },
+                }
+            )
+            self.assertIsNotNone(open_response)
+            self.assertFalse(open_response["result"]["isError"])  # type: ignore[index]
+
+            snapshot_response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 41,
+                    "method": "tools/call",
+                    "params": {"name": "device_snapshot", "arguments": {"session_file": session_file}},
+                }
+            )
+            self.assertIsNotNone(snapshot_response)
+            self.assertFalse(snapshot_response["result"]["isError"])  # type: ignore[index]
+
+            verify_response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 42,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "device_verify",
+                        "arguments": {
+                            "session_file": session_file,
+                            "element": "search_box",
+                            "expected": "mismatch-value",
+                            "timeout_ms": 100,
+                        },
+                    },
+                }
+            )
+            self.assertIsNotNone(verify_response)
+            self.assertTrue(verify_response["result"]["isError"])  # type: ignore[index]
+            verify_result = verify_response["result"]["structuredContent"]["result_json"]["result"]  # type: ignore[index]
+            self.assertEqual(verify_result["verdict"], "fail")
+            self.assertEqual(verify_result["error_code"], "assertion_mismatch")
+
 
 if __name__ == "__main__":
     unittest.main()

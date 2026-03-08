@@ -34,8 +34,10 @@ def _read_events(path: Path) -> list[dict[str, Any]]:
     return events
 
 
-def _event_matches(event: dict[str, Any], filters: dict[str, str]) -> bool:
+def _event_matches(event: dict[str, Any], filters: dict[str, str], run_id: str) -> bool:
     for key, value in filters.items():
+        if key == "run_id" and run_id != value:
+            return False
         if key == "action" and str(event.get("action")) != value:
             return False
         if key == "phase" and str(event.get("phase")) != value:
@@ -88,7 +90,7 @@ def main() -> None:
     for run_dir in run_dirs:
         events = _read_events(run_dir / "events.jsonl")
         for event in events:
-            if _event_matches(event, filters):
+            if _event_matches(event, filters, run_dir.name):
                 matches.append(
                     {
                         "run_id": run_dir.name,

@@ -66,9 +66,14 @@ class TestAndroidBridge(unittest.TestCase):
         cls.server.server_close()
         cls.server_thread.join(timeout=2)
 
-    def _client(self) -> AndroidTreeClient:
+    def _client(
+        self,
+        *,
+        forward_result: dict[str, object] | None = None,
+        forward_list_result: dict[str, object] | None = None,
+    ) -> tuple[AndroidTreeClient, list[list[str]]]:
         client = AndroidTreeClient(AndroidBridgeConfig(local_port=self.port, remote_port=self.port, timeout_seconds=1.0))
-        client.ensure_port_forward = lambda: {  # type: ignore[method-assign]
+        client.ensure_port_forward = lambda: forward_result or {  # type: ignore[method-assign]
             "status": "ok",
             "command": "adb forward tcp:test tcp:test",
             "returncode": 0,
@@ -76,32 +81,76 @@ class TestAndroidBridge(unittest.TestCase):
             "stderr": "",
             "latency_ms": 0,
         }
-        client._run_adb = lambda args: {  # type: ignore[method-assign]
-            "command": "adb forward --list",
-            "returncode": 0,
-            "stdout": "",
-            "stderr": "",
-            "latency_ms": 0,
-        }
-        return client
+        adb_calls: list[list[str]] = []
+
+        def run_adb(args: list[str]) -> dict[str, object]:
+            adb_calls.append(list(args))
+            return forward_list_result or {
+                "command": "adb forward --list",
+                "returncode": 0,
+                "stdout": "",
+                "stderr": "",
+                "latency_ms": 0,
+            }
+
+        client._run_adb = run_adb  # type: ignore[method-assign]
+        return client, adb_calls
 
     def test_health_success(self) -> None:
         _BridgeHandler.health_payload = {"ready": True, "package": "com.example.app", "protocol_version": "bridge.v1"}
-        client = self._client()
+        client, adb_calls = self._client()
         result = client.health(app_package="com.example.app")
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["bridge_status"], "ok")
+        self.assertEqual(adb_calls, [])
+        self.assertNotIn("adb_forward_list", result["capture_trace"])
 
     def test_health_status_ok_without_ready(self) -> None:
         _BridgeHandler.health_payload = {"status": "ok", "package": "com.example.app"}
-        client = self._client()
+        client, adb_calls = self._client()
         result = client.health(app_package="com.example.app")
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["bridge_status"], "ok")
+        self.assertEqual(adb_calls, [])
+
+    def test_health_failure_collects_forward_list_diagnostics(self) -> None:
+        _BridgeHandler.health_payload = {"ready": False, "package": "com.example.app"}
+        client, adb_calls = self._client(
+            forward_list_result={
+                "status": "ok",
+                "command": "adb forward --list",
+                "returncode": 0,
+                "stdout": "emulator-5554 tcp:18765 tcp:18765",
+                "stderr": "",
+                "latency_ms": 0,
+                "entries": [
+                    {
+                        "serial": "emulator-5554",
+                        "local": "tcp:18765",
+                        "remote": "tcp:18765",
+                        "local_port": 18765,
+                        "remote_port": 18765,
+                        "matches_config": True,
+                    }
+                ],
+                "forward_active": True,
+                "bridge_config": {
+                    "local_port": self.port,
+                    "remote_port": self.port,
+                    "timeout_seconds": 1.0,
+                    "serial": None,
+                },
+            }
+        )
+        result = client.health(app_package="com.example.app")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error_code"], "bridge_not_integrated")
+        self.assertEqual(adb_calls, [["forward", "--list"]])
+        self.assertTrue(result["capture_trace"]["adb_forward_list"]["forward_active"])
 
     def test_snapshot_protocol_invalid_nodes(self) -> None:
         _BridgeHandler.snapshot_payload = {"root": "n0", "nodes": "invalid"}  # type: ignore[assignment]
-        client = self._client()
+        client, _ = self._client()
         result = client.snapshot(app_package="com.example.app", options={"compact": True})
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["error_code"], "bridge_protocol_invalid")
