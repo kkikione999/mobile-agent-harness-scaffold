@@ -37,33 +37,131 @@ class AndroidDriver(DeviceHarness):
         return self._bridge.health(app_package=self.app_identity())
 
     def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        options = dict(options or {})
         if not self.dispatch_commands:
             return super().snapshot(options)
 
-        # Try ADB uiautomator first
+        if self._lightweight_snapshot_requested(options):
+            capture = self._bridge.snapshot(app_package=self.app_identity(), options=options)
+            if capture.get("status") == "ok":
+                return self._normalize_bridge_snapshot(capture, options=options)
+
+            adb_capture = self._adb_snapshot()
+            if adb_capture.get("status") == "ok":
+                return self._normalize_adb_fallback(adb_capture, bridge_capture=capture, options=options)
+
+            return self._synthetic_snapshot_fallback(options, bridge_capture=capture, adb_capture=adb_capture)
+
         adb_capture = self._adb_snapshot()
         if adb_capture.get("status") == "ok":
-            return self._normalize_adb_snapshot(adb_capture)
+            return self._normalize_adb_snapshot(adb_capture, options=options)
 
-        # Fallback to bridge
         capture = self._bridge.snapshot(app_package=self.app_identity(), options=options)
         if capture.get("status") != "ok":
-            fallback = super().snapshot(options)
-            fallback["capture_source"] = "bridge_error_fallback"
-            fallback["capture_latency_ms"] = int(capture.get("latency_ms", 0))
-            fallback["source_request_id"] = capture.get("request_id")
-            fallback["capture_error"] = {
-                "error_code": capture.get("error_code"),
-                "details": capture.get("details"),
-                "bridge_status": capture.get("bridge_status"),
-                "bridge_error_code": capture.get("bridge_error_code"),
-                "bridge_http_status": capture.get("bridge_http_status"),
-            }
-            fallback["capture_trace"] = capture.get("capture_trace")
-            fallback["raw_tree"] = capture.get("payload")
-            return fallback
+            return self._synthetic_snapshot_fallback(options, bridge_capture=capture, adb_capture=adb_capture)
 
-        return self._normalize_bridge_snapshot(capture)
+        return self._normalize_bridge_snapshot(capture, options=options)
+
+    @staticmethod
+    def _snapshot_request_metadata(options: dict[str, Any] | None = None) -> dict[str, bool]:
+        options = dict(options or {})
+        return {
+            "interactive_only": AndroidDriver._to_bool(options.get("interactive_only"), False),
+            "compact": AndroidDriver._to_bool(options.get("compact"), False),
+        }
+
+    @classmethod
+    def _lightweight_snapshot_requested(cls, options: dict[str, Any] | None = None) -> bool:
+        request = cls._snapshot_request_metadata(options)
+        return request["interactive_only"] or request["compact"]
+
+    def _apply_snapshot_request(self, snapshot: dict[str, Any], options: dict[str, Any] | None = None) -> dict[str, Any]:
+        request = self._snapshot_request_metadata(options)
+        snapshot["snapshot_request"] = request
+
+        report = snapshot.get("normalization_report")
+        if not isinstance(report, dict):
+            report = {}
+        report["interactive_only_requested"] = request["interactive_only"]
+        report["compact_requested"] = request["compact"]
+
+        if request["interactive_only"]:
+            elements = [
+                element
+                for element in snapshot.get("elements", [])
+                if isinstance(element, dict) and element.get("interactive")
+            ]
+            snapshot["elements"] = elements
+            snapshot["root"] = elements[0]["ref"] if elements else "root"
+            snapshot["tree_hash"] = self._tree_hash(elements)
+            snapshot["element_map"] = {el["id"]: el["ref"] for el in elements if el.get("id")}
+            report["interactive_only_applied"] = True
+            report["filtered_node_count"] = len(elements)
+
+        snapshot["normalization_report"] = report
+        return snapshot
+
+    @staticmethod
+    def _bridge_error_details(
+        capture: dict[str, Any],
+        *,
+        error_code: str | None = None,
+        details: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "error_code": error_code or capture.get("error_code"),
+            "details": details or capture.get("details"),
+            "bridge_status": capture.get("bridge_status"),
+            "bridge_error_code": capture.get("bridge_error_code"),
+            "bridge_http_status": capture.get("bridge_http_status"),
+        }
+
+    def _normalize_adb_fallback(
+        self,
+        adb_capture: dict[str, Any],
+        *,
+        bridge_capture: dict[str, Any],
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        snapshot = self._normalize_adb_snapshot(adb_capture, options=options)
+        snapshot["capture_source"] = "adb_uiautomator_fallback"
+        snapshot["capture_error"] = self._bridge_error_details(bridge_capture)
+        snapshot["raw_tree"] = bridge_capture.get("payload")
+        trace = snapshot.get("capture_trace")
+        if not isinstance(trace, dict):
+            trace = {}
+        trace["bridge_snapshot"] = bridge_capture.get("capture_trace")
+        snapshot["capture_trace"] = trace
+        return snapshot
+
+    def _synthetic_snapshot_fallback(
+        self,
+        options: dict[str, Any] | None,
+        *,
+        bridge_capture: dict[str, Any],
+        adb_capture: dict[str, Any] | None = None,
+        error_code: str | None = None,
+        details: str | None = None,
+    ) -> dict[str, Any]:
+        fallback = super().snapshot(options)
+        fallback = self._apply_snapshot_request(fallback, options)
+        fallback["capture_source"] = "bridge_error_fallback"
+        fallback["capture_latency_ms"] = int(bridge_capture.get("latency_ms", 0))
+        fallback["source_request_id"] = bridge_capture.get("request_id")
+        fallback["capture_error"] = self._bridge_error_details(
+            bridge_capture,
+            error_code=error_code,
+            details=details,
+        )
+        if isinstance(adb_capture, dict) and adb_capture.get("status") != "ok":
+            fallback["capture_error"]["adb_error_code"] = adb_capture.get("error_code")
+            fallback["capture_error"]["adb_details"] = adb_capture.get("details")
+        trace = {"bridge_snapshot": bridge_capture.get("capture_trace")}
+        if isinstance(adb_capture, dict):
+            trace["adb_snapshot"] = adb_capture
+        fallback["capture_trace"] = trace
+        fallback["raw_tree"] = bridge_capture.get("payload")
+        return fallback
 
     def _adb_prefix(self) -> list[str]:
         prefix = ["adb"]
@@ -106,14 +204,18 @@ class AndroidDriver(DeviceHarness):
         except Exception as e:
             return {"status": "error", "error_code": "adb_exception", "details": str(e)}
 
-    def _normalize_adb_snapshot(self, capture: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_adb_snapshot(
+        self,
+        capture: dict[str, Any],
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Normalize ADB uiautomator snapshot to cat.v2 format."""
         xml_content = capture.get("xml", "")
 
         try:
             root = ET.fromstring(xml_content)
         except ET.ParseError as e:
-            return {
+            snapshot = {
                 "schema_version": "cat.v2",
                 "platform": self.platform,
                 "captured_at": datetime.now(timezone.utc).isoformat(),
@@ -122,6 +224,7 @@ class AndroidDriver(DeviceHarness):
                 "capture_source": "adb_parse_error",
                 "capture_error": {"error_code": "xml_parse_error", "details": str(e)},
             }
+            return self._apply_snapshot_request(snapshot, options)
 
         elements = []
         node_index = 0
@@ -192,7 +295,7 @@ class AndroidDriver(DeviceHarness):
         for idx, child in enumerate(root):
             traverse(child, f"0/{idx}", 0)
 
-        return {
+        snapshot = {
             "schema_version": "cat.v2",
             "platform": self.platform,
             "captured_at": datetime.now(timezone.utc).isoformat(),
@@ -204,6 +307,7 @@ class AndroidDriver(DeviceHarness):
             "source_request_id": capture.get("request_id"),
             "capture_trace": {"adb_dump": "success"},
         }
+        return self._apply_snapshot_request(snapshot, options)
 
     def command_for_action(self, action: dict[str, Any]) -> str | None:
         op = action.get("action")
@@ -304,24 +408,28 @@ class AndroidDriver(DeviceHarness):
                 return [cls._to_int(parts[0], 0), cls._to_int(parts[1], 0), cls._to_int(parts[2], 0), cls._to_int(parts[3], 0)]
         return [0, 0, 0, 0]
 
-    def _normalize_bridge_snapshot(self, capture: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_bridge_snapshot(
+        self,
+        capture: dict[str, Any],
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         raw_payload = capture.get("payload")
         if not isinstance(raw_payload, dict):
-            fallback = super().snapshot({"compact": True, "interactive_only": True})
-            fallback["capture_source"] = "bridge_error_fallback"
-            fallback["capture_error"] = {"error_code": "bridge_protocol_invalid", "details": "bridge payload was not an object"}
-            fallback["capture_trace"] = capture.get("capture_trace")
-            fallback["raw_tree"] = raw_payload
-            return fallback
+            return self._synthetic_snapshot_fallback(
+                options,
+                bridge_capture=capture,
+                error_code="bridge_protocol_invalid",
+                details="bridge payload was not an object",
+            )
 
         raw_nodes = raw_payload.get("nodes", [])
         if not isinstance(raw_nodes, list) or not raw_nodes:
-            fallback = super().snapshot({"compact": True, "interactive_only": True})
-            fallback["capture_source"] = "bridge_error_fallback"
-            fallback["capture_error"] = {"error_code": "bridge_empty_tree", "details": "bridge returned empty node list"}
-            fallback["capture_trace"] = capture.get("capture_trace")
-            fallback["raw_tree"] = raw_payload
-            return fallback
+            return self._synthetic_snapshot_fallback(
+                options,
+                bridge_capture=capture,
+                error_code="bridge_empty_tree",
+                details="bridge returned empty node list",
+            )
 
         nodes_by_id: dict[str, dict[str, Any]] = {}
         children: dict[str, list[str]] = {}
@@ -366,12 +474,12 @@ class AndroidDriver(DeviceHarness):
                 children.setdefault(parent_id, []).append(source_id)
 
         if not nodes_by_id:
-            fallback = super().snapshot({"compact": True, "interactive_only": True})
-            fallback["capture_source"] = "bridge_error_fallback"
-            fallback["capture_error"] = {"error_code": "bridge_empty_tree", "details": "bridge returned no valid nodes"}
-            fallback["capture_trace"] = capture.get("capture_trace")
-            fallback["raw_tree"] = raw_payload
-            return fallback
+            return self._synthetic_snapshot_fallback(
+                options,
+                bridge_capture=capture,
+                error_code="bridge_empty_tree",
+                details="bridge returned no valid nodes",
+            )
 
         root_id = str(raw_payload.get("root") or raw_payload.get("root_id") or "")
         if root_id not in nodes_by_id:
@@ -458,4 +566,4 @@ class AndroidDriver(DeviceHarness):
             "raw_tree": raw_payload,
             "capture_trace": capture.get("capture_trace"),
         }
-        return snapshot
+        return self._apply_snapshot_request(snapshot, options)
