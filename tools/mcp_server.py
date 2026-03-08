@@ -34,6 +34,7 @@ class DeviceSession:
     app: dict[str, Any]
     dispatch_commands: bool
     driver: Any
+    snapshot_cache: dict[str, Any] | None = None
 
 
 DEVICE_SESSION_CACHE: dict[str, DeviceSession] = {}
@@ -231,7 +232,21 @@ def _selector_from_value(value: str, platform: str) -> dict[str, Any]:
     return make_selector(by=by, value=value, platform_hint=platform)
 
 
-_LIST_FIELDS = ("id", "label", "ref", "resource_id", "text", "bounds", "path")
+_LIST_FIELDS = (
+    "id",
+    "label",
+    "ref",
+    "resource_id",
+    "text",
+    "content_desc",
+    "class_name",
+    "type",
+    "interactive",
+    "enabled",
+    "visible",
+    "bounds",
+    "path",
+)
 
 
 def _compact_elements(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -243,6 +258,84 @@ def _compact_elements(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(element, dict):
             compact.append({field: element.get(field) for field in _LIST_FIELDS})
     return compact
+
+
+def _cached_snapshot(
+    session: DeviceSession,
+    *,
+    interactive: bool = True,
+    compact: bool = True,
+    refresh: bool = False,
+) -> tuple[dict[str, Any], bool]:
+    if not refresh and isinstance(session.snapshot_cache, dict):
+        return session.snapshot_cache, True
+    snapshot = session.driver.snapshot({"interactive_only": interactive, "compact": compact})
+    session.snapshot_cache = snapshot if isinstance(snapshot, dict) else None
+    return snapshot, False
+
+
+def _invalidate_snapshot_cache(session: DeviceSession) -> None:
+    session.snapshot_cache = None
+
+
+def _score_text_match(query: str, value: str, *, exact: bool) -> int:
+    if not value:
+        return 0
+    q = query.strip().lower()
+    v = value.strip().lower()
+    if not q or not v:
+        return 0
+    if v == q:
+        return 4
+    if exact:
+        return 0
+    if q in v:
+        return 2
+    return 0
+
+
+def _find_elements(
+    elements: list[dict[str, Any]],
+    query: str,
+    *,
+    field: str = "any",
+    exact: bool = False,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    search_fields = ("id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type")
+    if field != "any":
+        if field not in search_fields:
+            raise ValueError(f"unsupported find field: {field}")
+        selected_fields = (field,)
+    else:
+        selected_fields = search_fields
+
+    results: list[dict[str, Any]] = []
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        best_score = 0
+        best_field = ""
+        for candidate_field in selected_fields:
+            score = _score_text_match(query, str(element.get(candidate_field, "")), exact=exact)
+            if score > best_score:
+                best_score = score
+                best_field = candidate_field
+        if best_score <= 0:
+            continue
+        row = {field_name: element.get(field_name) for field_name in _LIST_FIELDS}
+        row["match_field"] = best_field
+        row["match_score"] = best_score
+        results.append(row)
+
+    results.sort(
+        key=lambda item: (
+            -int(item.get("match_score", 0)),
+            str(item.get("path", "")),
+            str(item.get("ref", "")),
+        )
+    )
+    return results[: max(1, limit)]
 
 
 def _load_session_from_file(path: Path) -> DeviceSession | None:
@@ -261,7 +354,13 @@ def _load_session_from_file(path: Path) -> DeviceSession | None:
     state = raw.get("state", {})
     if isinstance(state, dict):
         driver.restore_state(state)
-    return DeviceSession(platform=platform, app=app, dispatch_commands=dispatch_commands, driver=driver)
+    return DeviceSession(
+        platform=platform,
+        app=app,
+        dispatch_commands=dispatch_commands,
+        driver=driver,
+        snapshot_cache=None,
+    )
 
 
 def _save_session_to_file(path: Path, session: DeviceSession) -> None:
@@ -318,7 +417,13 @@ def _tool_device_open(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
     launch = driver.interact({"action": "launch_app"})
     preflight = driver.preflight()
 
-    session = DeviceSession(platform=platform, app=app, dispatch_commands=dispatch_commands, driver=driver)
+    session = DeviceSession(
+        platform=platform,
+        app=app,
+        dispatch_commands=dispatch_commands,
+        driver=driver,
+        snapshot_cache=None,
+    )
     DEVICE_SESSION_CACHE[cache_key] = session
     if persist_session:
         _save_session_to_file(session_path, session)
@@ -345,10 +450,16 @@ def _tool_device_snapshot(arguments: dict[str, Any], runner: Runner) -> tuple[bo
     _ = runner
     interactive = _optional_bool(arguments, "interactive")
     compact = _optional_bool(arguments, "compact")
+    refresh = bool(_optional_bool(arguments, "refresh") or False)
     session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
     assert session is not None
 
-    result_json = session.driver.snapshot({"interactive_only": bool(interactive), "compact": bool(compact)})
+    result_json, cache_hit = _cached_snapshot(
+        session,
+        interactive=bool(interactive),
+        compact=bool(compact),
+        refresh=refresh,
+    )
     if persist_session:
         _save_session_to_file(session_path, session)
 
@@ -359,6 +470,7 @@ def _tool_device_snapshot(arguments: dict[str, Any], runner: Runner) -> tuple[bo
         "stdout": json.dumps(result_json, ensure_ascii=True),
         "stderr": "",
         "result_json": result_json,
+        "cache_hit": cache_hit,
         "session_file": str(session_path),
         "persist_session": persist_session,
     }
@@ -367,10 +479,11 @@ def _tool_device_snapshot(arguments: dict[str, Any], runner: Runner) -> tuple[bo
 
 def _tool_device_list(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
     _ = runner
+    refresh = bool(_optional_bool(arguments, "refresh") or False)
     session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
     assert session is not None
 
-    snapshot = session.driver.snapshot({"interactive_only": True, "compact": True})
+    snapshot, cache_hit = _cached_snapshot(session, interactive=True, compact=True, refresh=refresh)
     elements = _compact_elements(snapshot)
     if persist_session:
         _save_session_to_file(session_path, session)
@@ -382,9 +495,46 @@ def _tool_device_list(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
         "stdout": json.dumps(elements, ensure_ascii=True),
         "stderr": "",
         "result_json": elements,
+        "cache_hit": cache_hit,
         "session_file": str(session_path),
         "persist_session": persist_session,
     }
+    return False, payload
+
+
+def _tool_device_find(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    _ = runner
+    query = _expect_str(arguments, "query")
+    field = _optional_str(arguments, "field") or "any"
+    exact = bool(_optional_bool(arguments, "exact") or False)
+    refresh = bool(_optional_bool(arguments, "refresh") or False)
+    limit = _optional_int(arguments, "limit") or 20
+    session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
+    assert session is not None
+
+    snapshot, cache_hit = _cached_snapshot(session, interactive=True, compact=True, refresh=refresh)
+    elements = snapshot.get("elements", []) if isinstance(snapshot, dict) else []
+    if not isinstance(elements, list):
+        elements = []
+    matches = _find_elements(elements, query, field=field, exact=exact, limit=limit)
+
+    payload = {
+        "command": ["device_find", query],
+        "env_overrides": {"DISPATCH_COMMANDS": "1" if session.dispatch_commands else "0"},
+        "exit_code": 0,
+        "stdout": json.dumps(matches, ensure_ascii=True),
+        "stderr": "",
+        "result_json": matches,
+        "query": query,
+        "field": field,
+        "exact": exact,
+        "limit": max(1, limit),
+        "cache_hit": cache_hit,
+        "session_file": str(session_path),
+        "persist_session": persist_session,
+    }
+    if persist_session:
+        _save_session_to_file(session_path, session)
     return False, payload
 
 
@@ -395,7 +545,14 @@ def _tool_device_press(arguments: dict[str, Any], runner: Runner) -> tuple[bool,
     assert session is not None
 
     selector = _selector_from_value(element, session.platform)
-    result = session.driver.interact({"action": "tap", "selector": selector})
+    cached_elements = None
+    if isinstance(session.snapshot_cache, dict):
+        maybe_elements = session.snapshot_cache.get("elements", [])
+        if isinstance(maybe_elements, list):
+            cached_elements = maybe_elements
+    result = session.driver.interact({"action": "tap", "selector": selector}, elements=cached_elements)
+    if result.get("status") not in {"error", "fail"}:
+        _invalidate_snapshot_cache(session)
     if persist_session:
         _save_session_to_file(session_path, session)
     result_json = {"status": "ok", "operation": "press", "result": result}
@@ -421,7 +578,17 @@ def _tool_device_fill(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
     assert session is not None
 
     selector = _selector_from_value(element, session.platform)
-    result = session.driver.interact({"action": "input_text", "selector": selector, "text": text})
+    cached_elements = None
+    if isinstance(session.snapshot_cache, dict):
+        maybe_elements = session.snapshot_cache.get("elements", [])
+        if isinstance(maybe_elements, list):
+            cached_elements = maybe_elements
+    result = session.driver.interact(
+        {"action": "input_text", "selector": selector, "text": text},
+        elements=cached_elements,
+    )
+    if result.get("status") not in {"error", "fail"}:
+        _invalidate_snapshot_cache(session)
     if persist_session:
         _save_session_to_file(session_path, session)
     result_json = {"status": "ok", "operation": "fill", "result": result}
@@ -477,6 +644,7 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], Runner], tuple[bool, dict[str
     "device_open": _tool_device_open,
     "device_snapshot": _tool_device_snapshot,
     "device_list": _tool_device_list,
+    "device_find": _tool_device_find,
     "device_press": _tool_device_press,
     "device_fill": _tool_device_fill,
     "device_verify": _tool_device_verify,
@@ -587,6 +755,7 @@ def tool_schemas() -> list[dict[str, Any]]:
                     "session_file": {"type": "string"},
                     "interactive": {"type": "boolean"},
                     "compact": {"type": "boolean"},
+                    "refresh": {"type": "boolean"},
                     "dispatch_commands": {"type": "boolean"},
                     "persist_session": {"type": "boolean"},
                 },
@@ -601,10 +770,33 @@ def tool_schemas() -> list[dict[str, Any]]:
                 "type": "object",
                 "properties": {
                     "session_file": {"type": "string"},
+                    "refresh": {"type": "boolean"},
                     "dispatch_commands": {"type": "boolean"},
                     "persist_session": {"type": "boolean"},
                 },
                 "required": [],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "device_find",
+            "description": "Find likely elements by query from interactive session snapshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "field": {
+                        "type": "string",
+                        "enum": ["any", "id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type"],
+                    },
+                    "exact": {"type": "boolean"},
+                    "limit": {"type": "integer"},
+                    "refresh": {"type": "boolean"},
+                    "session_file": {"type": "string"},
+                    "dispatch_commands": {"type": "boolean"},
+                    "persist_session": {"type": "boolean"},
+                },
+                "required": ["query"],
                 "additionalProperties": False,
             },
         },

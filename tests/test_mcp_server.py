@@ -41,6 +41,7 @@ class TestMCPServer(unittest.TestCase):
         self.assertIn("evaluate_run", names)
         self.assertIn("device_open", names)
         self.assertIn("device_list", names)
+        self.assertIn("device_find", names)
 
     def test_run_scenario_tool_call_maps_to_script_and_parses_run_dir(self) -> None:
         runner = _FakeRunner(
@@ -137,12 +138,32 @@ class TestMCPServer(unittest.TestCase):
                 }
             )
             self.assertIsNotNone(list_response)
-            elements = list_response["result"]["structuredContent"]["result_json"]  # type: ignore[index]
+            list_structured = list_response["result"]["structuredContent"]  # type: ignore[index]
+            elements = list_structured["result_json"]
             self.assertIsInstance(elements, list)
             self.assertTrue(elements)
             for field in ("id", "label", "ref", "resource_id", "text", "bounds", "path"):
                 self.assertIn(field, elements[0])
             self.assertTrue(any(el.get("id") == "search_box" for el in elements))
+            self.assertTrue(list_structured["cache_hit"])
+
+            find_response = server.handle_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 216,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "device_find",
+                        "arguments": {"session_file": session_file, "query": "search", "field": "id"},
+                    },
+                }
+            )
+            self.assertIsNotNone(find_response)
+            find_structured = find_response["result"]["structuredContent"]  # type: ignore[index]
+            matches = find_structured["result_json"]
+            self.assertTrue(find_structured["cache_hit"])
+            self.assertTrue(matches)
+            self.assertEqual(matches[0]["id"], "search_box")
 
             fill_response = server.handle_message(
                 {

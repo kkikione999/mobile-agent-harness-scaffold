@@ -41,7 +41,21 @@ def _build_driver(session: dict[str, Any]) -> AndroidDriver | IOSDriver:
     return driver
 
 
-_LIST_FIELDS = ("id", "label", "ref", "resource_id", "text", "bounds", "path")
+_LIST_FIELDS = (
+    "id",
+    "label",
+    "ref",
+    "resource_id",
+    "text",
+    "content_desc",
+    "class_name",
+    "type",
+    "interactive",
+    "enabled",
+    "visible",
+    "bounds",
+    "path",
+)
 
 
 def _compact_elements(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -53,6 +67,86 @@ def _compact_elements(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(element, dict):
             compact.append({field: element.get(field) for field in _LIST_FIELDS})
     return compact
+
+
+def _cached_snapshot(
+    session: dict[str, Any],
+    driver: AndroidDriver | IOSDriver,
+    *,
+    refresh: bool = False,
+    interactive: bool = True,
+    compact: bool = True,
+) -> tuple[dict[str, Any], bool]:
+    cache = session.get("snapshot_cache")
+    if not refresh and isinstance(cache, dict):
+        return cache, True
+    snapshot = driver.snapshot({"interactive_only": interactive, "compact": compact})
+    session["snapshot_cache"] = snapshot
+    return snapshot, False
+
+
+def _invalidate_snapshot_cache(session: dict[str, Any]) -> None:
+    session.pop("snapshot_cache", None)
+
+
+def _score_text_match(query: str, value: str, *, exact: bool) -> int:
+    if not value:
+        return 0
+    q = query.strip().lower()
+    v = value.strip().lower()
+    if not q or not v:
+        return 0
+    if v == q:
+        return 4
+    if exact:
+        return 0
+    if q in v:
+        return 2
+    return 0
+
+
+def _find_elements(
+    elements: list[dict[str, Any]],
+    query: str,
+    *,
+    field: str = "any",
+    exact: bool = False,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    search_fields = ("id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type")
+    if field != "any":
+        if field not in search_fields:
+            raise SystemExit(f"unsupported field: {field}")
+        selected_fields = (field,)
+    else:
+        selected_fields = search_fields
+
+    results: list[dict[str, Any]] = []
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        best_score = 0
+        best_field = ""
+        for candidate_field in selected_fields:
+            score = _score_text_match(query, str(element.get(candidate_field, "")), exact=exact)
+            if score > best_score:
+                best_score = score
+                best_field = candidate_field
+        if best_score <= 0:
+            continue
+        row = {field_name: element.get(field_name) for field_name in _LIST_FIELDS}
+        row["match_field"] = best_field
+        row["match_score"] = best_score
+        results.append(row)
+
+    results.sort(
+        key=lambda item: (
+            -int(item.get("match_score", 0)),
+            str(item.get("path", "")),
+            str(item.get("ref", "")),
+        )
+    )
+    return results[: max(1, limit)]
 
 
 def _selector_from_value(value: str, platform: str) -> dict[str, Any]:
@@ -77,6 +171,7 @@ def cmd_open(args: argparse.Namespace) -> None:
         "app": app,
         "dispatch_commands": dispatch_commands,
         "state": driver.dump_state(),
+        "snapshot_cache": None,
     }
     _save_session(Path(args.session_file), session)
     status = "ok"
@@ -100,10 +195,16 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
     if not session:
         raise SystemExit(f"session not found: {args.session_file}")
     driver = _build_driver(session)
-    snapshot = driver.snapshot({"interactive_only": args.interactive, "compact": args.compact})
+    snapshot, cache_hit = _cached_snapshot(
+        session,
+        driver,
+        refresh=bool(getattr(args, "refresh", False)),
+        interactive=args.interactive,
+        compact=args.compact,
+    )
     session["state"] = driver.dump_state()
     _save_session(Path(args.session_file), session)
-    print(json.dumps(snapshot, indent=2, ensure_ascii=True))
+    print(json.dumps({"cache_hit": cache_hit, "snapshot": snapshot}, indent=2, ensure_ascii=True))
 
 
 def cmd_list(args: argparse.Namespace) -> None:
@@ -111,11 +212,44 @@ def cmd_list(args: argparse.Namespace) -> None:
     if not session:
         raise SystemExit(f"session not found: {args.session_file}")
     driver = _build_driver(session)
-    snapshot = driver.snapshot({"interactive_only": True, "compact": True})
+    snapshot, cache_hit = _cached_snapshot(
+        session,
+        driver,
+        refresh=bool(getattr(args, "refresh", False)),
+        interactive=True,
+        compact=True,
+    )
     session["state"] = driver.dump_state()
     _save_session(Path(args.session_file), session)
     elements = _compact_elements(snapshot)
-    print(json.dumps(elements, indent=2, ensure_ascii=True))
+    print(json.dumps({"cache_hit": cache_hit, "elements": elements}, indent=2, ensure_ascii=True))
+
+
+def cmd_find(args: argparse.Namespace) -> None:
+    session = _load_session(Path(args.session_file))
+    if not session:
+        raise SystemExit(f"session not found: {args.session_file}")
+    driver = _build_driver(session)
+    snapshot, cache_hit = _cached_snapshot(
+        session,
+        driver,
+        refresh=bool(getattr(args, "refresh", False)),
+        interactive=True,
+        compact=True,
+    )
+    elements = snapshot.get("elements", [])
+    if not isinstance(elements, list):
+        elements = []
+    matches = _find_elements(
+        elements,
+        args.query,
+        field=args.field,
+        exact=bool(args.exact),
+        limit=int(args.limit),
+    )
+    session["state"] = driver.dump_state()
+    _save_session(Path(args.session_file), session)
+    print(json.dumps({"cache_hit": cache_hit, "matches": matches}, indent=2, ensure_ascii=True))
 
 
 def cmd_press(args: argparse.Namespace) -> None:
@@ -124,7 +258,15 @@ def cmd_press(args: argparse.Namespace) -> None:
         raise SystemExit(f"session not found: {args.session_file}")
     driver = _build_driver(session)
     selector = _selector_from_value(args.element, session["platform"])
-    result = driver.interact({"action": "tap", "selector": selector})
+    cached_elements = None
+    cache = session.get("snapshot_cache")
+    if isinstance(cache, dict):
+        maybe_elements = cache.get("elements", [])
+        if isinstance(maybe_elements, list):
+            cached_elements = maybe_elements
+    result = driver.interact({"action": "tap", "selector": selector}, elements=cached_elements)
+    if result.get("status") not in {"error", "fail"}:
+        _invalidate_snapshot_cache(session)
     session["state"] = driver.dump_state()
     _save_session(Path(args.session_file), session)
     print(json.dumps({"status": "ok", "operation": "press", "result": result}, indent=2, ensure_ascii=True))
@@ -136,7 +278,15 @@ def cmd_fill(args: argparse.Namespace) -> None:
         raise SystemExit(f"session not found: {args.session_file}")
     driver = _build_driver(session)
     selector = _selector_from_value(args.element, session["platform"])
-    result = driver.interact({"action": "input_text", "selector": selector, "text": args.text})
+    cached_elements = None
+    cache = session.get("snapshot_cache")
+    if isinstance(cache, dict):
+        maybe_elements = cache.get("elements", [])
+        if isinstance(maybe_elements, list):
+            cached_elements = maybe_elements
+    result = driver.interact({"action": "input_text", "selector": selector, "text": args.text}, elements=cached_elements)
+    if result.get("status") not in {"error", "fail"}:
+        _invalidate_snapshot_cache(session)
     session["state"] = driver.dump_state()
     _save_session(Path(args.session_file), session)
     print(json.dumps({"status": "ok", "operation": "fill", "result": result}, indent=2, ensure_ascii=True))
@@ -173,10 +323,20 @@ def main() -> None:
     snapshot_parser = sub.add_parser("snapshot", help="Capture a compact accessibility tree.")
     snapshot_parser.add_argument("-i", "--interactive", action="store_true")
     snapshot_parser.add_argument("-c", "--compact", action="store_true")
+    snapshot_parser.add_argument("--refresh", action="store_true")
     snapshot_parser.set_defaults(func=cmd_snapshot)
 
     list_parser = sub.add_parser("list", help="List selector-friendly elements from snapshot.")
+    list_parser.add_argument("--refresh", action="store_true")
     list_parser.set_defaults(func=cmd_list)
+
+    find_parser = sub.add_parser("find", help="Find likely elements by query.")
+    find_parser.add_argument("query")
+    find_parser.add_argument("--field", default="any")
+    find_parser.add_argument("--exact", action="store_true")
+    find_parser.add_argument("--limit", type=int, default=20)
+    find_parser.add_argument("--refresh", action="store_true")
+    find_parser.set_defaults(func=cmd_find)
 
     press_parser = sub.add_parser("press", help="Tap a referenced element.")
     press_parser.add_argument("element", help="@e ref or element id")
