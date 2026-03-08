@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any
@@ -247,7 +248,7 @@ class DeviceHarness(ABC):
         selector = assertion.get("selector")
         timeout_ms = int(assertion.get("timeout_ms", assertion.get("timeout", 0) * 1000 or 5000))
         poll_ms = int(assertion.get("poll_ms", 250))
-        elapsed = 0
+        started = time.monotonic()
         expected_value = assertion.get("value")
         expected_text = "" if expected_value is None else str(expected_value)
         last_actual: str | None = None
@@ -278,7 +279,8 @@ class DeviceHarness(ABC):
                         "snapshot_tree_hash": snapshot.get("tree_hash"),
                     }
 
-            if elapsed >= timeout_ms:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            if elapsed_ms >= timeout_ms:
                 if target is not None:
                     return {
                         "status": "fail",
@@ -288,7 +290,7 @@ class DeviceHarness(ABC):
                         "expected": expected_text or "visible",
                         "actual": last_actual,
                         "selector": selector,
-                        "elapsed_ms": elapsed,
+                        "elapsed_ms": elapsed_ms,
                     }
                 return {
                     "status": "fail",
@@ -296,12 +298,13 @@ class DeviceHarness(ABC):
                     "error_code": "assertion_timeout",
                     "details": "assertion condition was not met before timeout",
                     "selector": selector,
-                    "elapsed_ms": elapsed,
+                    "elapsed_ms": elapsed_ms,
                 }
 
-            sleep_seconds = poll_ms / 1000.0
-            subprocess.run(f"sleep {sleep_seconds}", shell=True, check=False)
-            elapsed += poll_ms
+            remaining_seconds = max(0.0, (timeout_ms - elapsed_ms) / 1000.0)
+            sleep_seconds = min(max(poll_ms, 0) / 1000.0, remaining_seconds)
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
 
     def replay(self, script: list[dict[str, Any]]) -> dict[str, Any]:
         trace: list[dict[str, Any]] = []
