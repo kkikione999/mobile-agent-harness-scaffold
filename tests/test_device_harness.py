@@ -26,6 +26,22 @@ class TestDeviceHarness(unittest.TestCase):
         self.assertEqual(diff["schema_version"], "cat.diff.v2")
         self.assertEqual(verify["verdict"], "pass")
 
+    def test_verify_fails_when_expected_value_mismatches(self) -> None:
+        driver = AndroidDriver(app={"android_package": "com.example.app"}, dispatch_commands=False)
+        driver.interact({"action": "launch_app"})
+        mismatch = driver.verify(
+            {
+                "action": "assert_visible",
+                "target": "home_screen",
+                "value": "not-home-screen",
+                "timeout_ms": 100,
+                "poll_ms": 50,
+            }
+        )
+
+        self.assertEqual(mismatch["verdict"], "fail")
+        self.assertEqual(mismatch["error_code"], "assertion_mismatch")
+
     def test_selector_tap_uses_bounds_without_snapshot(self) -> None:
         class CountingDriver(AndroidDriver):
             def __init__(self, app: dict[str, str], dispatch_commands: bool) -> None:
