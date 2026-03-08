@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -26,6 +26,8 @@ class CommandResult:
 
 Runner = Callable[[list[str], Optional[dict[str, str]]], CommandResult]
 DEFAULT_SESSION_FILE = ".device_harness_session.json"
+LIGHTWEIGHT_SNAPSHOT_OPTIONS = (True, True)
+SnapshotOptions = tuple[bool, bool]
 
 
 @dataclass
@@ -34,7 +36,7 @@ class DeviceSession:
     app: dict[str, Any]
     dispatch_commands: bool
     driver: Any
-    snapshot_cache: dict[str, Any] | None = None
+    snapshot_cache: dict[SnapshotOptions, dict[str, Any]] = field(default_factory=dict)
 
 
 DEVICE_SESSION_CACHE: dict[str, DeviceSession] = {}
@@ -260,22 +262,48 @@ def _compact_elements(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return compact
 
 
+def _resolve_snapshot_options(
+    interactive: bool | None = None,
+    compact: bool | None = None,
+) -> SnapshotOptions:
+    default_interactive, default_compact = LIGHTWEIGHT_SNAPSHOT_OPTIONS
+    return (
+        default_interactive if interactive is None else interactive,
+        default_compact if compact is None else compact,
+    )
+
+
 def _cached_snapshot(
     session: DeviceSession,
     *,
-    interactive: bool = True,
-    compact: bool = True,
+    interactive: bool | None = None,
+    compact: bool | None = None,
     refresh: bool = False,
 ) -> tuple[dict[str, Any], bool]:
-    if not refresh and isinstance(session.snapshot_cache, dict):
-        return session.snapshot_cache, True
-    snapshot = session.driver.snapshot({"interactive_only": interactive, "compact": compact})
-    session.snapshot_cache = snapshot if isinstance(snapshot, dict) else None
+    options = _resolve_snapshot_options(interactive=interactive, compact=compact)
+    if not refresh:
+        cached = session.snapshot_cache.get(options)
+        if isinstance(cached, dict):
+            return cached, True
+    snapshot = session.driver.snapshot({"interactive_only": options[0], "compact": options[1]})
+    if isinstance(snapshot, dict):
+        session.snapshot_cache[options] = snapshot
     return snapshot, False
 
 
 def _invalidate_snapshot_cache(session: DeviceSession) -> None:
-    session.snapshot_cache = None
+    session.snapshot_cache.clear()
+
+
+def _cached_elements(session: DeviceSession) -> list[dict[str, Any]] | None:
+    for options in (LIGHTWEIGHT_SNAPSHOT_OPTIONS, (False, True), (True, False), (False, False)):
+        snapshot = session.snapshot_cache.get(options)
+        if not isinstance(snapshot, dict):
+            continue
+        maybe_elements = snapshot.get("elements", [])
+        if isinstance(maybe_elements, list):
+            return maybe_elements
+    return None
 
 
 def _score_text_match(query: str, value: str, *, exact: bool) -> int:
@@ -359,7 +387,6 @@ def _load_session_from_file(path: Path) -> DeviceSession | None:
         app=app,
         dispatch_commands=dispatch_commands,
         driver=driver,
-        snapshot_cache=None,
     )
 
 
@@ -422,7 +449,6 @@ def _tool_device_open(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
         app=app,
         dispatch_commands=dispatch_commands,
         driver=driver,
-        snapshot_cache=None,
     )
     DEVICE_SESSION_CACHE[cache_key] = session
     if persist_session:
@@ -454,10 +480,11 @@ def _tool_device_snapshot(arguments: dict[str, Any], runner: Runner) -> tuple[bo
     session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
     assert session is not None
 
+    interactive, compact = _resolve_snapshot_options(interactive=interactive, compact=compact)
     result_json, cache_hit = _cached_snapshot(
         session,
-        interactive=bool(interactive),
-        compact=bool(compact),
+        interactive=interactive,
+        compact=compact,
         refresh=refresh,
     )
     if persist_session:
@@ -470,6 +497,7 @@ def _tool_device_snapshot(arguments: dict[str, Any], runner: Runner) -> tuple[bo
         "stdout": json.dumps(result_json, ensure_ascii=True),
         "stderr": "",
         "result_json": result_json,
+        "snapshot_options": {"interactive": interactive, "compact": compact},
         "cache_hit": cache_hit,
         "session_file": str(session_path),
         "persist_session": persist_session,
@@ -545,11 +573,7 @@ def _tool_device_press(arguments: dict[str, Any], runner: Runner) -> tuple[bool,
     assert session is not None
 
     selector = _selector_from_value(element, session.platform)
-    cached_elements = None
-    if isinstance(session.snapshot_cache, dict):
-        maybe_elements = session.snapshot_cache.get("elements", [])
-        if isinstance(maybe_elements, list):
-            cached_elements = maybe_elements
+    cached_elements = _cached_elements(session)
     result = session.driver.interact({"action": "tap", "selector": selector}, elements=cached_elements)
     if result.get("status") not in {"error", "fail"}:
         _invalidate_snapshot_cache(session)
@@ -578,11 +602,7 @@ def _tool_device_fill(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
     assert session is not None
 
     selector = _selector_from_value(element, session.platform)
-    cached_elements = None
-    if isinstance(session.snapshot_cache, dict):
-        maybe_elements = session.snapshot_cache.get("elements", [])
-        if isinstance(maybe_elements, list):
-            cached_elements = maybe_elements
+    cached_elements = _cached_elements(session)
     result = session.driver.interact(
         {"action": "input_text", "selector": selector, "text": text},
         elements=cached_elements,
@@ -866,6 +886,37 @@ def _response(result: dict[str, Any], request_id: Any) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
+def _payload_text(name: str, payload: dict[str, Any], is_error: bool) -> str:
+    status = "error" if is_error else "ok"
+    parts = [f"{name}: {status}"]
+
+    exit_code = payload.get("exit_code")
+    if isinstance(exit_code, int):
+        parts.append(f"exit_code={exit_code}")
+
+    if "cache_hit" in payload:
+        parts.append(f"cache_hit={bool(payload.get('cache_hit'))}")
+
+    snapshot_options = payload.get("snapshot_options")
+    if isinstance(snapshot_options, dict):
+        parts.append(
+            "snapshot_options="
+            f"{int(bool(snapshot_options.get('interactive')))}:{int(bool(snapshot_options.get('compact')))}"
+        )
+
+    for key in ("run_dir", "bundle_path", "report_path", "replay_report_path", "updated_session_path", "session_file"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            parts.append(f"{key}={value}")
+            break
+
+    query = payload.get("query")
+    if isinstance(query, str) and query:
+        parts.append(f"query={query}")
+
+    return "; ".join(parts)
+
+
 class MCPServer:
     def __init__(self, runner: Runner = _run_command):
         self._runner = runner
@@ -923,10 +974,9 @@ class MCPServer:
             except Exception as exc:  # pragma: no cover - defensive path
                 return _error(-32000, f"tool execution failed: {exc}", request_id)
 
-            body = json.dumps(payload, indent=2, ensure_ascii=True)
             return _response(
                 {
-                    "content": [{"type": "text", "text": body}],
+                    "content": [{"type": "text", "text": _payload_text(name, payload, is_error)}],
                     "structuredContent": payload,
                     "isError": is_error,
                 },
