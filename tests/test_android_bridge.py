@@ -76,10 +76,24 @@ class TestAndroidBridge(unittest.TestCase):
             "stderr": "",
             "latency_ms": 0,
         }
+        client._run_adb = lambda args: {  # type: ignore[method-assign]
+            "command": "adb forward --list",
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "latency_ms": 0,
+        }
         return client
 
     def test_health_success(self) -> None:
         _BridgeHandler.health_payload = {"ready": True, "package": "com.example.app", "protocol_version": "bridge.v1"}
+        client = self._client()
+        result = client.health(app_package="com.example.app")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["bridge_status"], "ok")
+
+    def test_health_status_ok_without_ready(self) -> None:
+        _BridgeHandler.health_payload = {"status": "ok", "package": "com.example.app"}
         client = self._client()
         result = client.health(app_package="com.example.app")
         self.assertEqual(result["status"], "ok")
@@ -91,6 +105,24 @@ class TestAndroidBridge(unittest.TestCase):
         result = client.snapshot(app_package="com.example.app", options={"compact": True})
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["error_code"], "bridge_protocol_invalid")
+
+    def test_list_port_forwards_parses_entries(self) -> None:
+        client = AndroidTreeClient(
+            AndroidBridgeConfig(local_port=18765, remote_port=18765, timeout_seconds=1.0, serial="emulator-5554")
+        )
+        client._run_adb = lambda args: {  # type: ignore[method-assign]
+            "command": "adb forward --list",
+            "returncode": 0,
+            "stdout": "emulator-5554 tcp:18765 tcp:18765\nother tcp:1111 tcp:2222",
+            "stderr": "",
+            "latency_ms": 1,
+        }
+        result = client.list_port_forwards()
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["forward_active"])
+        entries = result["entries"]
+        self.assertEqual(entries[0]["local_port"], 18765)
+        self.assertTrue(entries[0]["matches_config"])
 
 
 if __name__ == "__main__":

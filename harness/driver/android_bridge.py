@@ -21,6 +21,14 @@ class AndroidTreeClient:
     def __init__(self, config: AndroidBridgeConfig) -> None:
         self.config = config
 
+    def _config_payload(self) -> dict[str, Any]:
+        return {
+            "local_port": self.config.local_port,
+            "remote_port": self.config.remote_port,
+            "timeout_seconds": self.config.timeout_seconds,
+            "serial": self.config.serial,
+        }
+
     def _adb_prefix(self) -> list[str]:
         prefix = ["adb"]
         if self.config.serial:
@@ -30,7 +38,17 @@ class AndroidTreeClient:
     def _run_adb(self, args: list[str]) -> dict[str, Any]:
         cmd = self._adb_prefix() + args
         started = time.perf_counter()
-        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        try:
+            completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except FileNotFoundError as exc:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            return {
+                "command": " ".join(cmd),
+                "returncode": 127,
+                "stdout": "",
+                "stderr": str(exc),
+                "latency_ms": elapsed_ms,
+            }
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         return {
             "command": " ".join(cmd),
@@ -51,9 +69,64 @@ class AndroidTreeClient:
                 "status": "error",
                 "error_code": "bridge_forward_failed",
                 "details": "failed to create adb forward tunnel for Android bridge",
+                "bridge_config": self._config_payload(),
                 **result,
             }
-        return {"status": "ok", **result}
+        return {"status": "ok", "bridge_config": self._config_payload(), **result}
+
+    @staticmethod
+    def _parse_forward_port(value: str) -> int | None:
+        if ":" not in value:
+            return None
+        tail = value.split(":", 1)[1]
+        try:
+            return int(tail)
+        except ValueError:
+            return None
+
+    def list_port_forwards(self) -> dict[str, Any]:
+        result = self._run_adb(["forward", "--list"])
+        if result["returncode"] != 0:
+            return {
+                "status": "error",
+                "error_code": "bridge_forward_list_failed",
+                "details": "failed to list adb forward rules",
+                "bridge_config": self._config_payload(),
+                **result,
+            }
+
+        entries: list[dict[str, Any]] = []
+        for line in result.get("stdout", "").splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            serial, local, remote = parts[:3]
+            entry: dict[str, Any] = {
+                "serial": serial,
+                "local": local,
+                "remote": remote,
+            }
+            local_port = self._parse_forward_port(local)
+            remote_port = self._parse_forward_port(remote)
+            if local_port is not None:
+                entry["local_port"] = local_port
+            if remote_port is not None:
+                entry["remote_port"] = remote_port
+
+            matches = local_port == self.config.local_port and remote_port == self.config.remote_port
+            if self.config.serial:
+                matches = matches and serial == self.config.serial
+            entry["matches_config"] = matches
+            entries.append(entry)
+
+        forward_active = any(entry.get("matches_config") for entry in entries)
+        return {
+            "status": "ok",
+            "entries": entries,
+            "forward_active": forward_active,
+            "bridge_config": self._config_payload(),
+            **result,
+        }
 
     def _request_json(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         body: bytes | None = None
@@ -62,7 +135,8 @@ class AndroidTreeClient:
             body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
-        req = request.Request(f"{self.base_url}{path}", data=body, method=method, headers=headers)
+        url = f"{self.base_url}{path}"
+        req = request.Request(url, data=body, method=method, headers=headers)
         started = time.perf_counter()
         try:
             with request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
@@ -71,6 +145,7 @@ class AndroidTreeClient:
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 return {
                     "status": "ok",
+                    "url": url,
                     "http_status": resp.status,
                     "body": parsed,
                     "raw_body": raw,
@@ -83,6 +158,7 @@ class AndroidTreeClient:
                 "status": "error",
                 "error_code": "bridge_http_error",
                 "details": f"bridge endpoint returned http {exc.code}",
+                "url": url,
                 "http_status": exc.code,
                 "raw_body": raw,
                 "latency_ms": elapsed_ms,
@@ -93,6 +169,7 @@ class AndroidTreeClient:
                 "status": "error",
                 "error_code": "bridge_unreachable",
                 "details": str(exc.reason),
+                "url": url,
                 "latency_ms": elapsed_ms,
             }
         except TimeoutError:
@@ -101,6 +178,7 @@ class AndroidTreeClient:
                 "status": "error",
                 "error_code": "bridge_timeout",
                 "details": "bridge request timed out",
+                "url": url,
                 "latency_ms": elapsed_ms,
             }
         except json.JSONDecodeError as exc:
@@ -109,6 +187,7 @@ class AndroidTreeClient:
                 "status": "error",
                 "error_code": "bridge_protocol_invalid",
                 "details": f"bridge returned invalid json: {exc}",
+                "url": url,
                 "latency_ms": elapsed_ms,
             }
 
@@ -119,6 +198,8 @@ class AndroidTreeClient:
             "capture_source": "android_accessibility_bridge",
             "request_id": request_id,
             "adb_forward": adb_result,
+            "bridge_config": self._config_payload(),
+            "adb_forward_list": self.list_port_forwards(),
         }
         if adb_result["status"] != "ok":
             return {
@@ -156,7 +237,12 @@ class AndroidTreeClient:
                 "capture_trace": trace,
             }
 
-        ready = bool(body.get("ready", False))
+        ready_value = body.get("ready")
+        if ready_value is None:
+            status_value = str(body.get("status", "")).strip().lower()
+            ready = status_value in {"ok", "ready", "true"}
+        else:
+            ready = bool(ready_value)
         bridge_package = str(body.get("package", ""))
         if not ready or (bridge_package and bridge_package != app_package):
             return {
@@ -197,6 +283,7 @@ class AndroidTreeClient:
             "request_id": request_id,
             "request_payload": payload,
             "adb_forward": adb_result,
+            "bridge_config": self._config_payload(),
         }
         if adb_result["status"] != "ok":
             return {
