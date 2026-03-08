@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from tools import mcp_server
 
@@ -24,6 +26,65 @@ class _FailRunner:
     def __call__(self, command: list[str], env_overrides: dict[str, str] | None = None) -> mcp_server.CommandResult:
         _ = (command, env_overrides)
         raise AssertionError("subprocess runner should not be used for device_* tools")
+
+
+class _RecordingDriver:
+    def __init__(self, app: dict[str, Any], dispatch_commands: bool) -> None:
+        self.app = app
+        self.dispatch_commands = dispatch_commands
+        self.snapshot_calls: list[dict[str, bool]] = []
+        self.state: dict[str, Any] = {}
+
+    def preflight(self) -> dict[str, Any]:
+        return {"status": "ok"}
+
+    def interact(self, action: dict[str, Any], elements: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        _ = elements
+        if action.get("action") == "launch_app":
+            return {"status": "ok"}
+        return {"status": "ok", "action": action.get("action")}
+
+    def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        resolved = {
+            "interactive_only": bool((options or {}).get("interactive_only", False)),
+            "compact": bool((options or {}).get("compact", False)),
+        }
+        self.snapshot_calls.append(resolved)
+        suffix = f"{int(resolved['interactive_only'])}:{int(resolved['compact'])}:{len(self.snapshot_calls)}"
+        elements = [
+            {
+                "id": f"search_box_{suffix}",
+                "label": "Search Box",
+                "ref": f"@e-{suffix}",
+                "resource_id": f"search_box_{suffix}",
+                "text": "",
+                "content_desc": "search box",
+                "class_name": "android.widget.EditText",
+                "type": "input",
+                "interactive": resolved["interactive_only"],
+                "enabled": True,
+                "visible": True,
+                "bounds": [0, 0, 100, 40],
+                "path": "0/1",
+            }
+        ]
+        return {
+            "schema_version": "cat.v2",
+            "tree_hash": suffix,
+            "elements": elements,
+            "options": resolved,
+            "element_map": {elements[0]["id"]: elements[0]["ref"]},
+            "capture_trace": {"details": "x" * 256},
+        }
+
+    def dump_state(self) -> dict[str, Any]:
+        return dict(self.state)
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        self.state = dict(state)
+
+    def verify(self, assertion: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "ok", "verdict": "pass", "assertion": assertion}
 
 
 class TestMCPServer(unittest.TestCase):
@@ -234,6 +295,170 @@ class TestMCPServer(unittest.TestCase):
             )
             self.assertIsNotNone(snapshot_response)
             self.assertFalse(snapshot_response["result"]["isError"])  # type: ignore[index]
+
+    def test_device_snapshot_defaults_to_lightweight_options(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mcp-device-defaults-") as tmp:
+            session_file = str(Path(tmp) / "session.json")
+            driver = _RecordingDriver(app={"android_package": "com.example.app"}, dispatch_commands=False)
+            server = mcp_server.MCPServer(runner=_FailRunner())
+
+            with mock.patch("tools.mcp_server._build_device_driver", return_value=driver):
+                open_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 50,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "device_open",
+                            "arguments": {
+                                "platform": "android",
+                                "app": "com.example.app",
+                                "dispatch_commands": False,
+                                "session_file": session_file,
+                            },
+                        },
+                    }
+                )
+                self.assertIsNotNone(open_response)
+
+                snapshot_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 51,
+                        "method": "tools/call",
+                        "params": {"name": "device_snapshot", "arguments": {"session_file": session_file}},
+                    }
+                )
+
+            self.assertIsNotNone(snapshot_response)
+            self.assertEqual(driver.snapshot_calls, [{"interactive_only": True, "compact": True}])
+            structured = snapshot_response["result"]["structuredContent"]  # type: ignore[index]
+            self.assertEqual(structured["snapshot_options"], {"interactive": True, "compact": True})
+            self.assertEqual(structured["result_json"]["options"], {"interactive_only": True, "compact": True})
+
+    def test_device_snapshot_cache_is_keyed_by_option_tuple(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mcp-device-cache-") as tmp:
+            session_file = str(Path(tmp) / "session.json")
+            driver = _RecordingDriver(app={"android_package": "com.example.app"}, dispatch_commands=False)
+            server = mcp_server.MCPServer(runner=_FailRunner())
+
+            with mock.patch("tools.mcp_server._build_device_driver", return_value=driver):
+                open_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 60,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "device_open",
+                            "arguments": {
+                                "platform": "android",
+                                "app": "com.example.app",
+                                "dispatch_commands": False,
+                                "session_file": session_file,
+                            },
+                        },
+                    }
+                )
+                self.assertIsNotNone(open_response)
+
+                default_snapshot_1 = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 61,
+                        "method": "tools/call",
+                        "params": {"name": "device_snapshot", "arguments": {"session_file": session_file}},
+                    }
+                )
+                default_snapshot_2 = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 62,
+                        "method": "tools/call",
+                        "params": {"name": "device_snapshot", "arguments": {"session_file": session_file}},
+                    }
+                )
+                full_snapshot_1 = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 63,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "device_snapshot",
+                            "arguments": {"session_file": session_file, "interactive": False, "compact": False},
+                        },
+                    }
+                )
+                full_snapshot_2 = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 64,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "device_snapshot",
+                            "arguments": {"session_file": session_file, "interactive": False, "compact": False},
+                        },
+                    }
+                )
+
+            self.assertEqual(
+                driver.snapshot_calls,
+                [
+                    {"interactive_only": True, "compact": True},
+                    {"interactive_only": False, "compact": False},
+                ],
+            )
+            self.assertFalse(default_snapshot_1["result"]["structuredContent"]["cache_hit"])  # type: ignore[index]
+            self.assertTrue(default_snapshot_2["result"]["structuredContent"]["cache_hit"])  # type: ignore[index]
+            self.assertFalse(full_snapshot_1["result"]["structuredContent"]["cache_hit"])  # type: ignore[index]
+            self.assertTrue(full_snapshot_2["result"]["structuredContent"]["cache_hit"])  # type: ignore[index]
+            self.assertNotEqual(
+                default_snapshot_1["result"]["structuredContent"]["result_json"]["tree_hash"],  # type: ignore[index]
+                full_snapshot_1["result"]["structuredContent"]["result_json"]["tree_hash"],  # type: ignore[index]
+            )
+
+    def test_tools_call_text_content_is_smaller_than_structured_payload(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mcp-device-text-") as tmp:
+            session_file = str(Path(tmp) / "session.json")
+            driver = _RecordingDriver(app={"android_package": "com.example.app"}, dispatch_commands=False)
+            server = mcp_server.MCPServer(runner=_FailRunner())
+
+            with mock.patch("tools.mcp_server._build_device_driver", return_value=driver):
+                open_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 70,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "device_open",
+                            "arguments": {
+                                "platform": "android",
+                                "app": "com.example.app",
+                                "dispatch_commands": False,
+                                "session_file": session_file,
+                            },
+                        },
+                    }
+                )
+                self.assertIsNotNone(open_response)
+
+                snapshot_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 71,
+                        "method": "tools/call",
+                        "params": {"name": "device_snapshot", "arguments": {"session_file": session_file}},
+                    }
+                )
+
+            self.assertIsNotNone(snapshot_response)
+            result = snapshot_response["result"]  # type: ignore[index]
+            structured = result["structuredContent"]
+            text_payload = result["content"][0]["text"]
+            structured_json = json.dumps(structured, ensure_ascii=True)
+
+            self.assertIn("snapshot_options=1:1", text_payload)
+            self.assertNotIn('"result_json"', text_payload)
+            self.assertLess(len(text_payload), len(structured_json) // 2)
 
     def test_device_verify_mismatch_is_reported_as_error(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mcp-device-verify-mismatch-") as tmp:

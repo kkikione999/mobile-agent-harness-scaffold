@@ -16,6 +16,8 @@ from harness.driver.android import AndroidDriver
 from harness.driver.ios import IOSDriver
 from harness.driver.selectors import make_selector
 
+LIGHTWEIGHT_SNAPSHOT_OPTIONS = (True, True)
+
 
 def _load_session(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -69,24 +71,57 @@ def _compact_elements(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return compact
 
 
+def _resolve_snapshot_options(
+    interactive: bool | None = None,
+    compact: bool | None = None,
+) -> tuple[bool, bool]:
+    default_interactive, default_compact = LIGHTWEIGHT_SNAPSHOT_OPTIONS
+    return (
+        default_interactive if interactive is None else interactive,
+        default_compact if compact is None else compact,
+    )
+
+
 def _cached_snapshot(
     session: dict[str, Any],
     driver: AndroidDriver | IOSDriver,
     *,
     refresh: bool = False,
-    interactive: bool = True,
-    compact: bool = True,
+    interactive: bool | None = None,
+    compact: bool | None = None,
 ) -> tuple[dict[str, Any], bool]:
-    cache = session.get("snapshot_cache")
-    if not refresh and isinstance(cache, dict):
-        return cache, True
-    snapshot = driver.snapshot({"interactive_only": interactive, "compact": compact})
-    session["snapshot_cache"] = snapshot
+    options = _resolve_snapshot_options(interactive=interactive, compact=compact)
+    cache = session.setdefault("snapshot_cache", {})
+    if not isinstance(cache, dict):
+        cache = {}
+        session["snapshot_cache"] = cache
+    cache_key = f"{int(options[0])}:{int(options[1])}"
+    if not refresh:
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict):
+            return cached, True
+    snapshot = driver.snapshot({"interactive_only": options[0], "compact": options[1]})
+    if isinstance(snapshot, dict):
+        cache[cache_key] = snapshot
     return snapshot, False
 
 
 def _invalidate_snapshot_cache(session: dict[str, Any]) -> None:
-    session.pop("snapshot_cache", None)
+    session["snapshot_cache"] = {}
+
+
+def _cached_elements(session: dict[str, Any]) -> list[dict[str, Any]] | None:
+    cache = session.get("snapshot_cache")
+    if not isinstance(cache, dict):
+        return None
+    for cache_key in ("1:1", "0:1", "1:0", "0:0"):
+        snapshot = cache.get(cache_key)
+        if not isinstance(snapshot, dict):
+            continue
+        maybe_elements = snapshot.get("elements", [])
+        if isinstance(maybe_elements, list):
+            return maybe_elements
+    return None
 
 
 def _score_text_match(query: str, value: str, *, exact: bool) -> int:
@@ -171,7 +206,7 @@ def cmd_open(args: argparse.Namespace) -> None:
         "app": app,
         "dispatch_commands": dispatch_commands,
         "state": driver.dump_state(),
-        "snapshot_cache": None,
+        "snapshot_cache": {},
     }
     _save_session(Path(args.session_file), session)
     status = "ok"
@@ -195,12 +230,13 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
     if not session:
         raise SystemExit(f"session not found: {args.session_file}")
     driver = _build_driver(session)
+    interactive, compact = _resolve_snapshot_options(interactive=args.interactive, compact=args.compact)
     snapshot, cache_hit = _cached_snapshot(
         session,
         driver,
         refresh=bool(getattr(args, "refresh", False)),
-        interactive=args.interactive,
-        compact=args.compact,
+        interactive=interactive,
+        compact=compact,
     )
     session["state"] = driver.dump_state()
     _save_session(Path(args.session_file), session)
@@ -258,12 +294,7 @@ def cmd_press(args: argparse.Namespace) -> None:
         raise SystemExit(f"session not found: {args.session_file}")
     driver = _build_driver(session)
     selector = _selector_from_value(args.element, session["platform"])
-    cached_elements = None
-    cache = session.get("snapshot_cache")
-    if isinstance(cache, dict):
-        maybe_elements = cache.get("elements", [])
-        if isinstance(maybe_elements, list):
-            cached_elements = maybe_elements
+    cached_elements = _cached_elements(session)
     result = driver.interact({"action": "tap", "selector": selector}, elements=cached_elements)
     if result.get("status") not in {"error", "fail"}:
         _invalidate_snapshot_cache(session)
@@ -278,12 +309,7 @@ def cmd_fill(args: argparse.Namespace) -> None:
         raise SystemExit(f"session not found: {args.session_file}")
     driver = _build_driver(session)
     selector = _selector_from_value(args.element, session["platform"])
-    cached_elements = None
-    cache = session.get("snapshot_cache")
-    if isinstance(cache, dict):
-        maybe_elements = cache.get("elements", [])
-        if isinstance(maybe_elements, list):
-            cached_elements = maybe_elements
+    cached_elements = _cached_elements(session)
     result = driver.interact({"action": "input_text", "selector": selector, "text": args.text}, elements=cached_elements)
     if result.get("status") not in {"error", "fail"}:
         _invalidate_snapshot_cache(session)
@@ -321,8 +347,8 @@ def main() -> None:
     open_parser.set_defaults(func=cmd_open)
 
     snapshot_parser = sub.add_parser("snapshot", help="Capture a compact accessibility tree.")
-    snapshot_parser.add_argument("-i", "--interactive", action="store_true")
-    snapshot_parser.add_argument("-c", "--compact", action="store_true")
+    snapshot_parser.add_argument("-i", "--interactive", action=argparse.BooleanOptionalAction, default=None)
+    snapshot_parser.add_argument("-c", "--compact", action=argparse.BooleanOptionalAction, default=None)
     snapshot_parser.add_argument("--refresh", action="store_true")
     snapshot_parser.set_defaults(func=cmd_snapshot)
 
