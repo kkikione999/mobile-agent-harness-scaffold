@@ -199,9 +199,9 @@ class AndroidTreeClient:
             "request_id": request_id,
             "adb_forward": adb_result,
             "bridge_config": self._config_payload(),
-            "adb_forward_list": self.list_port_forwards(),
         }
         if adb_result["status"] != "ok":
+            trace["adb_forward_list"] = self.list_port_forwards()
             return {
                 "status": "error",
                 "error_code": adb_result["error_code"],
@@ -215,6 +215,7 @@ class AndroidTreeClient:
         response = self._request_json("GET", f"/health?package={app_package}")
         trace["http"] = response
         if response["status"] != "ok":
+            trace["adb_forward_list"] = self.list_port_forwards()
             return {
                 "status": "error",
                 "error_code": response["error_code"],
@@ -227,6 +228,7 @@ class AndroidTreeClient:
 
         body = response.get("body")
         if not isinstance(body, dict):
+            trace["adb_forward_list"] = self.list_port_forwards()
             return {
                 "status": "error",
                 "error_code": "bridge_protocol_invalid",
@@ -245,6 +247,7 @@ class AndroidTreeClient:
             ready = bool(ready_value)
         bridge_package = str(body.get("package", ""))
         if not ready or (bridge_package and bridge_package != app_package):
+            trace["adb_forward_list"] = self.list_port_forwards()
             return {
                 "status": "error",
                 "error_code": "bridge_not_integrated",
