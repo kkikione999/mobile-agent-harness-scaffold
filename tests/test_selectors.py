@@ -98,6 +98,72 @@ class TestSelectors(unittest.TestCase):
         self.assertIsNotNone(matched)
         self.assertEqual(info["match_type"], "resource_id")
 
+    def test_semantic_id_selector_prefers_exact_app_semantics(self) -> None:
+        elements = [
+            {
+                "ref": "@e111",
+                "id": "legacy_row",
+                "label": "settings.sign_out_tile",
+                "text": "settings.sign_out_tile",
+                "path": "0/2",
+            },
+            {
+                "ref": "@e222",
+                "id": "settings_sign_out_tile",
+                "semantic_id": "settings.sign_out_tile",
+                "label": "Sign out",
+                "text": "Sign out",
+                "path": "0/1",
+            },
+        ]
+
+        matched, info = resolve_selector({"by": "semantic_id", "value": "settings.sign_out_tile"}, elements)
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["ref"], "@e222")
+        self.assertEqual(info["match_type"], "semantic_id")
+        self.assertEqual(info["candidate_count"], 1)
+        self.assertEqual(info["confidence"], 1.0)
+
+    def test_semantic_id_selector_orders_ambiguous_matches_by_path(self) -> None:
+        elements = [
+            {
+                "ref": "@e111",
+                "id": "settings_sign_out_tile_primary",
+                "semantic_id": "settings.sign_out_tile",
+                "path": "0/2",
+            },
+            {
+                "ref": "@e222",
+                "id": "settings_sign_out_tile_secondary",
+                "semantic_id": "settings.sign_out_tile",
+                "path": "0/1",
+            },
+        ]
+
+        matched, info = resolve_selector({"by": "semantic_id", "value": "settings.sign_out_tile"}, elements)
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["ref"], "@e222")
+        self.assertEqual(info["match_type"], "semantic_id")
+        self.assertEqual(info["candidate_count"], 2)
+        self.assertEqual(info["confidence"], 0.85)
+
+    def test_semantic_id_selector_falls_back_to_legacy_id(self) -> None:
+        elements = [
+            {
+                "ref": "@e111",
+                "id": "settings_sign_out_tile",
+                "label": "Sign out",
+                "path": "0/1",
+            }
+        ]
+
+        matched, info = resolve_selector({"by": "semantic_id", "value": "settings.sign_out_tile"}, elements)
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["ref"], "@e111")
+        self.assertEqual(info["match_type"], "semantic_id_fallback")
+        self.assertEqual(info["fallback_field"], "id")
+        self.assertEqual(info["candidate_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

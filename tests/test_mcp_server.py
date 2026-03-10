@@ -87,6 +87,15 @@ class _RecordingDriver:
         return {"status": "ok", "verdict": "pass", "assertion": assertion}
 
 
+class _SemanticRecordingDriver(_RecordingDriver):
+    def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = super().snapshot(options)
+        payload["screen_id"] = "home_screen"
+        payload["elements"][0]["screen_id"] = "home_screen"
+        payload["elements"][0]["semantic_id"] = "search.query_input"
+        return payload
+
+
 class TestMCPServer(unittest.TestCase):
     def setUp(self) -> None:
         mcp_server.DEVICE_SESSION_CACHE.clear()
@@ -415,6 +424,96 @@ class TestMCPServer(unittest.TestCase):
                 default_snapshot_1["result"]["structuredContent"]["result_json"]["tree_hash"],  # type: ignore[index]
                 full_snapshot_1["result"]["structuredContent"]["result_json"]["tree_hash"],  # type: ignore[index]
             )
+
+    def test_device_list_surfaces_screen_and_semantic_ids_when_present(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mcp-device-semantics-list-") as tmp:
+            session_file = str(Path(tmp) / "session.json")
+            driver = _SemanticRecordingDriver(app={"android_package": "com.example.app"}, dispatch_commands=False)
+            server = mcp_server.MCPServer(runner=_FailRunner())
+
+            with mock.patch("tools.mcp_server._build_device_driver", return_value=driver):
+                open_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 65,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "device_open",
+                            "arguments": {
+                                "platform": "android",
+                                "app": "com.example.app",
+                                "dispatch_commands": False,
+                                "session_file": session_file,
+                            },
+                        },
+                    }
+                )
+                self.assertIsNotNone(open_response)
+
+                list_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 66,
+                        "method": "tools/call",
+                        "params": {"name": "device_list", "arguments": {"session_file": session_file}},
+                    }
+                )
+
+            self.assertIsNotNone(list_response)
+            result = list_response["result"]  # type: ignore[index]
+            structured = result["structuredContent"]
+            self.assertEqual(structured["screen_id"], "home_screen")
+            self.assertEqual(structured["result_json"][0]["screen_id"], "home_screen")
+            self.assertEqual(structured["result_json"][0]["semantic_id"], "search.query_input")
+            self.assertIn("screen_id=home_screen", result["content"][0]["text"])
+
+    def test_device_find_surfaces_screen_and_semantic_ids_when_present(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mcp-device-semantics-find-") as tmp:
+            session_file = str(Path(tmp) / "session.json")
+            driver = _SemanticRecordingDriver(app={"android_package": "com.example.app"}, dispatch_commands=False)
+            server = mcp_server.MCPServer(runner=_FailRunner())
+
+            with mock.patch("tools.mcp_server._build_device_driver", return_value=driver):
+                open_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 67,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "device_open",
+                            "arguments": {
+                                "platform": "android",
+                                "app": "com.example.app",
+                                "dispatch_commands": False,
+                                "session_file": session_file,
+                            },
+                        },
+                    }
+                )
+                self.assertIsNotNone(open_response)
+
+                find_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 68,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "device_find",
+                            "arguments": {
+                                "session_file": session_file,
+                                "query": "home_screen",
+                                "field": "screen_id",
+                            },
+                        },
+                    }
+                )
+
+            self.assertIsNotNone(find_response)
+            structured = find_response["result"]["structuredContent"]  # type: ignore[index]
+            self.assertEqual(structured["screen_id"], "home_screen")
+            self.assertEqual(structured["result_json"][0]["match_field"], "screen_id")
+            self.assertEqual(structured["result_json"][0]["screen_id"], "home_screen")
+            self.assertEqual(structured["result_json"][0]["semantic_id"], "search.query_input")
 
     def test_tools_call_text_content_is_smaller_than_structured_payload(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mcp-device-text-") as tmp:

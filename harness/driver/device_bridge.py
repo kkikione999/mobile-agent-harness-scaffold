@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -7,6 +8,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from harness.driver.selectors import build_anchor, build_ref, resolve_selector
+
+SEMANTIC_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+$")
 
 
 class DeviceHarness(ABC):
@@ -36,7 +39,7 @@ class DeviceHarness(ABC):
     def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         _ = options or {}
         elements = self._build_elements()
-        return {
+        snapshot = {
             "schema_version": "cat.v2",
             "platform": self.platform,
             "captured_at": datetime.now(timezone.utc).isoformat(),
@@ -56,6 +59,10 @@ class DeviceHarness(ABC):
                 "details": "snapshot generated from local harness state",
             },
         }
+        screen_id = self._screen_id_for_snapshot(elements)
+        if screen_id:
+            snapshot["screen_id"] = screen_id
+        return snapshot
 
     def diff(self, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
         before_map = {el["ref"]: el for el in before.get("elements", [])}
@@ -86,7 +93,7 @@ class DeviceHarness(ABC):
                 }
             )
 
-        attr_fields = {"id", "label", "type", "text", "resource_id", "content_desc", "class_name"}
+        attr_fields = {"id", "label", "type", "text", "resource_id", "content_desc", "class_name", "screen_id", "semantic_id"}
         state_fields = {
             "interactive",
             "clickable",
@@ -388,6 +395,7 @@ class DeviceHarness(ABC):
 
     def _build_elements(self) -> list[dict[str, Any]]:
         nodes: list[dict[str, Any]] = []
+        current_screen_id = self._current_screen_id()
         root = {
             "id": "root",
             "label": self.app_identity(),
@@ -411,6 +419,8 @@ class DeviceHarness(ABC):
             "index_in_parent": 0,
             "source_node_id": "root",
         }
+        if current_screen_id:
+            root["screen_id"] = current_screen_id
         root["ref"] = build_ref(self.platform, root)
         root["anchor"] = build_anchor(root)
         nodes.append(root)
@@ -440,10 +450,33 @@ class DeviceHarness(ABC):
                 "index_in_parent": idx,
                 "source_node_id": target,
             }
+            node_screen_id = target if target.endswith("_screen") else current_screen_id
+            if node_screen_id:
+                node["screen_id"] = node_screen_id
+            semantic_id = self._semantic_id_for_target(target)
+            if semantic_id:
+                node["semantic_id"] = semantic_id
             node["ref"] = build_ref(self.platform, node)
             node["anchor"] = build_anchor(node)
             nodes.append(node)
         return nodes
+
+    def _current_screen_id(self) -> str | None:
+        screen_targets = sorted(target for target in self._visible_targets if target.endswith("_screen"))
+        if not screen_targets:
+            return None
+        non_launch = [target for target in screen_targets if target != "launch_screen"]
+        return non_launch[0] if non_launch else screen_targets[0]
+
+    @staticmethod
+    def _semantic_id_for_target(target: str) -> str | None:
+        return target if SEMANTIC_ID_PATTERN.fullmatch(target) else None
+
+    def _screen_id_for_snapshot(self, elements: list[dict[str, Any]]) -> str | None:
+        explicit = [str(element.get("screen_id")) for element in elements if isinstance(element, dict) and element.get("screen_id")]
+        if explicit:
+            return explicit[0]
+        return self._current_screen_id()
 
     @staticmethod
     def _center_from_bounds(bounds: Any) -> tuple[int, int] | None:
@@ -482,7 +515,7 @@ class DeviceHarness(ABC):
 
     @staticmethod
     def _actual_candidates(target: dict[str, Any]) -> list[str]:
-        fields = ("text", "label", "id", "content_desc", "resource_id", "class_name", "type")
+        fields = ("text", "label", "semantic_id", "screen_id", "id", "content_desc", "resource_id", "class_name", "type")
         candidates: list[str] = []
         for field in fields:
             value = target.get(field)

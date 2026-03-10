@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -230,12 +231,26 @@ def _build_device_driver(platform: str, app: dict[str, Any], dispatch_commands: 
 def _selector_from_value(value: str, platform: str) -> dict[str, Any]:
     from harness.driver.selectors import make_selector
 
-    by = "ref" if value.startswith("@e") else "id"
+    if value.startswith("@e"):
+        by = "ref"
+    elif _looks_like_semantic_id(value):
+        by = "semantic_id"
+    else:
+        by = "id"
     return make_selector(by=by, value=value, platform_hint=platform)
+
+
+SEMANTIC_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+$")
+
+
+def _looks_like_semantic_id(value: str) -> bool:
+    return bool(SEMANTIC_ID_PATTERN.fullmatch(value.strip()))
 
 
 _LIST_FIELDS = (
     "id",
+    "screen_id",
+    "semantic_id",
     "label",
     "ref",
     "resource_id",
@@ -306,6 +321,22 @@ def _cached_elements(session: DeviceSession) -> list[dict[str, Any]] | None:
     return None
 
 
+def _snapshot_screen_id(snapshot: dict[str, Any]) -> str | None:
+    screen_id = snapshot.get("screen_id")
+    if isinstance(screen_id, str) and screen_id:
+        return screen_id
+    elements = snapshot.get("elements", [])
+    if not isinstance(elements, list):
+        return None
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        candidate = element.get("screen_id")
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
 def _score_text_match(query: str, value: str, *, exact: bool) -> int:
     if not value:
         return 0
@@ -330,7 +361,19 @@ def _find_elements(
     exact: bool = False,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    search_fields = ("id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type")
+    search_fields = ("screen_id", "semantic_id", "id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type")
+    field_priority = {
+        "screen_id": 0,
+        "semantic_id": 1,
+        "id": 2,
+        "resource_id": 3,
+        "label": 4,
+        "text": 5,
+        "content_desc": 6,
+        "ref": 7,
+        "class_name": 8,
+        "type": 9,
+    }
     if field != "any":
         if field not in search_fields:
             raise ValueError(f"unsupported find field: {field}")
@@ -346,7 +389,11 @@ def _find_elements(
         best_field = ""
         for candidate_field in selected_fields:
             score = _score_text_match(query, str(element.get(candidate_field, "")), exact=exact)
-            if score > best_score:
+            if score > best_score or (
+                score == best_score
+                and score > 0
+                and field_priority.get(candidate_field, 99) < field_priority.get(best_field, 99)
+            ):
                 best_score = score
                 best_field = candidate_field
         if best_score <= 0:
@@ -359,6 +406,7 @@ def _find_elements(
     results.sort(
         key=lambda item: (
             -int(item.get("match_score", 0)),
+            field_priority.get(str(item.get("match_field", "")), 99),
             str(item.get("path", "")),
             str(item.get("ref", "")),
         )
@@ -502,6 +550,10 @@ def _tool_device_snapshot(arguments: dict[str, Any], runner: Runner) -> tuple[bo
         "session_file": str(session_path),
         "persist_session": persist_session,
     }
+    if isinstance(result_json, dict):
+        screen_id = _snapshot_screen_id(result_json)
+        if screen_id:
+            payload["screen_id"] = screen_id
     return False, payload
 
 
@@ -527,6 +579,9 @@ def _tool_device_list(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
         "session_file": str(session_path),
         "persist_session": persist_session,
     }
+    screen_id = _snapshot_screen_id(snapshot)
+    if screen_id:
+        payload["screen_id"] = screen_id
     return False, payload
 
 
@@ -561,6 +616,10 @@ def _tool_device_find(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
         "session_file": str(session_path),
         "persist_session": persist_session,
     }
+    if isinstance(snapshot, dict):
+        screen_id = _snapshot_screen_id(snapshot)
+        if screen_id:
+            payload["screen_id"] = screen_id
     if persist_session:
         _save_session_to_file(session_path, session)
     return False, payload
@@ -807,7 +866,7 @@ def tool_schemas() -> list[dict[str, Any]]:
                     "query": {"type": "string"},
                     "field": {
                         "type": "string",
-                        "enum": ["any", "id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type"],
+                        "enum": ["any", "screen_id", "semantic_id", "id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type"],
                     },
                     "exact": {"type": "boolean"},
                     "limit": {"type": "integer"},
@@ -896,6 +955,10 @@ def _payload_text(name: str, payload: dict[str, Any], is_error: bool) -> str:
 
     if "cache_hit" in payload:
         parts.append(f"cache_hit={bool(payload.get('cache_hit'))}")
+
+    screen_id = payload.get("screen_id")
+    if isinstance(screen_id, str) and screen_id:
+        parts.append(f"screen_id={screen_id}")
 
     snapshot_options = payload.get("snapshot_options")
     if isinstance(snapshot_options, dict):
