@@ -454,7 +454,10 @@ class AndroidDriver(DeviceHarness):
                 "parent_id": parent_id,
                 "class_name": str(raw_node.get("class_name") or raw_node.get("class") or "android.view.View"),
                 "resource_id": str(raw_node.get("resource_id") or raw_node.get("view_id_resource_name") or ""),
+                "semantic_id": str(raw_node.get("semantic_id") or ""),
+                "screen_id": str(raw_node.get("screen_id") or ""),
                 "text": str(raw_node.get("text") or ""),
+                "label": str(raw_node.get("label") or ""),
                 "content_desc": str(raw_node.get("content_desc") or raw_node.get("contentDescription") or ""),
                 "bounds": self._normalize_bounds(raw_node.get("bounds")),
                 "clickable": self._to_bool(raw_node.get("clickable"), False),
@@ -497,7 +500,15 @@ class AndroidDriver(DeviceHarness):
                 return
             visited.add(node_id)
 
-            label = node["content_desc"] or node["text"] or node["resource_id"] or node["class_name"] or node["source_node_id"]
+            label = (
+                node["label"]
+                or node["content_desc"]
+                or node["text"]
+                or node["semantic_id"]
+                or node["resource_id"]
+                or node["class_name"]
+                or node["source_node_id"]
+            )
             node_type = node["class_name"] or "android.view.View"
             interactive = bool(node["clickable"] or node["focusable"] or node["editable"])
             element = {
@@ -509,6 +520,8 @@ class AndroidDriver(DeviceHarness):
                 "ordinal": len(ordered_elements),
                 "interactive": interactive,
                 "class_name": node["class_name"],
+                "semantic_id": node["semantic_id"] or None,
+                "screen_id": node["screen_id"] or None,
                 "resource_id": node["resource_id"],
                 "content_desc": node["content_desc"],
                 "bounds": node["bounds"],
@@ -550,6 +563,7 @@ class AndroidDriver(DeviceHarness):
             "platform": self.platform,
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "root": ordered_elements[0]["ref"],
+            "screen_id": str(raw_payload.get("screen_id") or nodes_by_id[root_id].get("screen_id") or ""),
             "elements": ordered_elements,
             "tree_hash": tree_hash,
             "element_map": {el["id"]: el["ref"] for el in ordered_elements if el.get("id")},
