@@ -36,6 +36,13 @@ class AndroidDriver(DeviceHarness):
             return {"status": "ok", "details": "dispatch disabled; using synthetic snapshot mode", "bridge_status": "synthetic"}
         return self._bridge.health(app_package=self.app_identity())
 
+    def _adb_prefix(self) -> list[str]:
+        prefix = ["adb"]
+        serial = os.getenv("ANDROID_SERIAL")
+        if serial:
+            prefix.extend(["-s", serial])
+        return prefix
+
     def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         options = dict(options or {})
         if not self.dispatch_commands:
@@ -44,7 +51,31 @@ class AndroidDriver(DeviceHarness):
         if self._lightweight_snapshot_requested(options):
             capture = self._bridge.snapshot(app_package=self.app_identity(), options=options)
             if capture.get("status") == "ok":
-                return self._normalize_bridge_snapshot(capture, options=options)
+                raw_payload = capture.get("payload")
+                raw_nodes = raw_payload.get("nodes", []) if isinstance(raw_payload, dict) else []
+                if isinstance(raw_nodes, list) and raw_nodes:
+                    return self._normalize_bridge_snapshot(capture, options=options)
+
+                adb_capture = self._adb_snapshot()
+                if adb_capture.get("status") == "ok":
+                    capture = dict(capture)
+                    capture["error_code"] = "bridge_empty_tree"
+                    capture["details"] = "bridge returned empty node list"
+                    capture["bridge_status"] = "error"
+                    capture["bridge_error_code"] = "bridge_empty_tree"
+                    return self._normalize_adb_fallback(adb_capture, bridge_capture=capture, options=options)
+
+                return self._synthetic_snapshot_fallback(
+                    options,
+                    bridge_capture=dict(
+                        capture,
+                        error_code="bridge_empty_tree",
+                        details="bridge returned empty node list",
+                        bridge_status="error",
+                        bridge_error_code="bridge_empty_tree",
+                    ),
+                    adb_capture=adb_capture,
+                )
 
             adb_capture = self._adb_snapshot()
             if adb_capture.get("status") == "ok":
@@ -162,13 +193,6 @@ class AndroidDriver(DeviceHarness):
         fallback["capture_trace"] = trace
         fallback["raw_tree"] = bridge_capture.get("payload")
         return fallback
-
-    def _adb_prefix(self) -> list[str]:
-        prefix = ["adb"]
-        serial = os.getenv("ANDROID_SERIAL")
-        if serial:
-            prefix.extend(["-s", serial])
-        return prefix
 
     def _adb_snapshot(self) -> dict[str, Any]:
         """Capture UI snapshot using ADB uiautomator."""
@@ -314,7 +338,13 @@ class AndroidDriver(DeviceHarness):
         package = str(self.app.get("android_package", ""))
 
         if op == "launch_app":
-            return f"adb shell monkey -p {shlex.quote(package)} -c android.intent.category.LAUNCHER 1"
+            adb_prefix = " ".join(shlex.quote(part) for part in self._adb_prefix())
+            quoted_package = shlex.quote(package)
+            return (
+                f'component=$({adb_prefix} shell cmd package resolve-activity --brief {quoted_package} | tail -n 1 | tr -d "\\r"); '
+                f'if [ -n "$component" ]; then {adb_prefix} shell am start -W "$component"; '
+                f'else {adb_prefix} shell monkey -p {quoted_package} -c android.intent.category.LAUNCHER 1; fi'
+            )
 
         if op == "tap":
             if "x" in action and "y" in action:
@@ -454,7 +484,10 @@ class AndroidDriver(DeviceHarness):
                 "parent_id": parent_id,
                 "class_name": str(raw_node.get("class_name") or raw_node.get("class") or "android.view.View"),
                 "resource_id": str(raw_node.get("resource_id") or raw_node.get("view_id_resource_name") or ""),
+                "semantic_id": str(raw_node.get("semantic_id") or ""),
+                "screen_id": str(raw_node.get("screen_id") or ""),
                 "text": str(raw_node.get("text") or ""),
+                "label": str(raw_node.get("label") or ""),
                 "content_desc": str(raw_node.get("content_desc") or raw_node.get("contentDescription") or ""),
                 "bounds": self._normalize_bounds(raw_node.get("bounds")),
                 "clickable": self._to_bool(raw_node.get("clickable"), False),
@@ -497,7 +530,15 @@ class AndroidDriver(DeviceHarness):
                 return
             visited.add(node_id)
 
-            label = node["content_desc"] or node["text"] or node["resource_id"] or node["class_name"] or node["source_node_id"]
+            label = (
+                node["label"]
+                or node["content_desc"]
+                or node["text"]
+                or node["semantic_id"]
+                or node["resource_id"]
+                or node["class_name"]
+                or node["source_node_id"]
+            )
             node_type = node["class_name"] or "android.view.View"
             interactive = bool(node["clickable"] or node["focusable"] or node["editable"])
             element = {
@@ -509,6 +550,8 @@ class AndroidDriver(DeviceHarness):
                 "ordinal": len(ordered_elements),
                 "interactive": interactive,
                 "class_name": node["class_name"],
+                "semantic_id": node["semantic_id"] or None,
+                "screen_id": node["screen_id"] or None,
                 "resource_id": node["resource_id"],
                 "content_desc": node["content_desc"],
                 "bounds": node["bounds"],
@@ -550,6 +593,7 @@ class AndroidDriver(DeviceHarness):
             "platform": self.platform,
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "root": ordered_elements[0]["ref"],
+            "screen_id": str(raw_payload.get("screen_id") or nodes_by_id[root_id].get("screen_id") or ""),
             "elements": ordered_elements,
             "tree_hash": tree_hash,
             "element_map": {el["id"]: el["ref"] for el in ordered_elements if el.get("id")},
