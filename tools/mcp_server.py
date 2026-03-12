@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -230,12 +231,85 @@ def _build_device_driver(platform: str, app: dict[str, Any], dispatch_commands: 
 def _selector_from_value(value: str, platform: str) -> dict[str, Any]:
     from harness.driver.selectors import make_selector
 
-    by = "ref" if value.startswith("@e") else "id"
+    if value.startswith("@e"):
+        by = "ref"
+    elif _looks_like_semantic_id(value):
+        by = "semantic_id"
+    else:
+        by = "id"
     return make_selector(by=by, value=value, platform_hint=platform)
+
+
+SEMANTIC_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+$")
+
+
+def _looks_like_semantic_id(value: str) -> bool:
+    return bool(SEMANTIC_ID_PATTERN.fullmatch(value.strip()))
+
+
+def _selector_from_payload(value: Any, platform: str) -> dict[str, Any]:
+    from harness.driver.selectors import make_selector
+
+    if not isinstance(value, dict):
+        raise ValueError("'selector' must be an object")
+    by = value.get("by")
+    target_value = value.get("value")
+    if not isinstance(by, str) or not by:
+        raise ValueError("'selector.by' must be a non-empty string")
+    if not isinstance(target_value, str) or not target_value:
+        raise ValueError("'selector.value' must be a non-empty string")
+
+    within = value.get("within")
+    if within is not None and (not isinstance(within, str) or not within):
+        raise ValueError("'selector.within' must be a non-empty string when provided")
+    anchor = value.get("anchor")
+    if anchor is not None and not isinstance(anchor, dict):
+        raise ValueError("'selector.anchor' must be an object when provided")
+    ambiguity_mode = value.get("ambiguity_mode")
+    if ambiguity_mode is not None and ambiguity_mode not in {"first", "error"}:
+        raise ValueError("'selector.ambiguity_mode' must be 'first' or 'error'")
+    candidate_limit = value.get("candidate_limit")
+    if candidate_limit is not None:
+        if isinstance(candidate_limit, bool) or not isinstance(candidate_limit, int):
+            raise ValueError("'selector.candidate_limit' must be an integer when provided")
+        if candidate_limit <= 0:
+            raise ValueError("'selector.candidate_limit' must be greater than 0")
+
+    return make_selector(
+        by=by,
+        value=target_value,
+        within=within,
+        platform_hint=platform,
+        anchor=anchor,
+        ambiguity_mode=ambiguity_mode,
+        candidate_limit=candidate_limit,
+    )
+
+
+def _selector_from_arguments(arguments: dict[str, Any], platform: str) -> tuple[dict[str, Any], bool]:
+    selector_payload = arguments.get("selector")
+    if selector_payload is not None:
+        return _selector_from_payload(selector_payload, platform), True
+    return _selector_from_value(_expect_str(arguments, "element"), platform), False
+
+
+def _selector_options(arguments: dict[str, Any], *, selector_supplied: bool) -> tuple[str | None, int | None]:
+    ambiguity_mode = _optional_str(arguments, "ambiguity_mode")
+    if ambiguity_mode is not None and ambiguity_mode not in {"first", "error"}:
+        raise ValueError("'ambiguity_mode' must be 'first' or 'error'")
+    candidate_limit = _optional_int(arguments, "candidate_limit")
+    if candidate_limit is not None and candidate_limit <= 0:
+        raise ValueError("'candidate_limit' must be greater than 0")
+
+    if ambiguity_mode is None and selector_supplied:
+        ambiguity_mode = "error"
+    return ambiguity_mode, candidate_limit
 
 
 _LIST_FIELDS = (
     "id",
+    "screen_id",
+    "semantic_id",
     "label",
     "ref",
     "resource_id",
@@ -260,6 +334,151 @@ def _compact_elements(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(element, dict):
             compact.append({field: element.get(field) for field in _LIST_FIELDS})
     return compact
+
+
+def _snapshot_screen_id(snapshot: dict[str, Any]) -> str | None:
+    screen_id = snapshot.get("screen_id")
+    if isinstance(screen_id, str) and screen_id:
+        return screen_id
+    elements = snapshot.get("elements", [])
+    if not isinstance(elements, list):
+        return None
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        candidate = element.get("screen_id")
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def _build_page_map(snapshot: dict[str, Any]) -> dict[str, Any]:
+    elements = snapshot.get("elements", [])
+    if not isinstance(elements, list) or not elements:
+        return {"tree_hash": snapshot.get("tree_hash"), "page": {"root": None, "signature": {}, "sections": [], "interactive_refs": []}}
+
+    root = elements[0] if isinstance(elements[0], dict) else {}
+    root_path = str(root.get("path", "0"))
+    root_prefix = f"{root_path}/"
+    sections: list[dict[str, Any]] = []
+
+    for element in elements[1:]:
+        if not isinstance(element, dict):
+            continue
+        path = str(element.get("path", ""))
+        if not path.startswith(root_prefix):
+            continue
+        relative = path[len(root_prefix):]
+        if not relative or "/" in relative:
+            continue
+        child_prefix = f"{path}/"
+        child_count = sum(
+            1
+            for candidate in elements
+            if isinstance(candidate, dict) and str(candidate.get("path", "")).startswith(child_prefix)
+        )
+        sections.append(
+            {
+                "ref": element.get("ref"),
+                "id": element.get("id"),
+                "label": element.get("label"),
+                "path": element.get("path"),
+                "child_count": child_count,
+                "interactive": bool(element.get("interactive")),
+                "visible": bool(element.get("visible", True)),
+            }
+        )
+
+    interactive_refs = [
+        element.get("ref")
+        for element in elements
+        if isinstance(element, dict)
+        and bool(element.get("interactive"))
+        and bool(element.get("visible", True))
+        and isinstance(element.get("ref"), str)
+    ]
+
+    root_summary = {
+        field: root.get(field)
+        for field in ("ref", "id", "screen_id", "semantic_id", "resource_id", "label", "text", "path")
+    }
+    signature = {
+        field: root.get(field)
+        for field in ("id", "screen_id", "semantic_id", "resource_id", "label", "text")
+    }
+    return {
+        "tree_hash": snapshot.get("tree_hash"),
+        "page": {
+            "screen_id": _snapshot_screen_id(snapshot),
+            "root": root_summary,
+            "signature": signature,
+            "sections": sections,
+            "interactive_refs": interactive_refs,
+        },
+    }
+
+
+def _build_element_dictionary(
+    snapshot: dict[str, Any],
+    *,
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    selected_fields = fields or ["screen_id", "semantic_id", "id", "resource_id", "label", "text", "content_desc"]
+    allowed_fields = {"screen_id", "semantic_id", "id", "resource_id", "label", "text", "content_desc", "class_name", "type"}
+    invalid = [field for field in selected_fields if field not in allowed_fields]
+    if invalid:
+        raise ValueError(f"unsupported dictionary fields: {', '.join(sorted(set(invalid)))}")
+
+    elements = snapshot.get("elements", [])
+    if not isinstance(elements, list):
+        elements = []
+
+    dictionary: dict[str, dict[str, Any]] = {field: {} for field in selected_fields}
+    ambiguous: list[dict[str, Any]] = []
+    for field in selected_fields:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            raw_value = element.get(field)
+            if raw_value is None:
+                continue
+            value = str(raw_value).strip()
+            if not value:
+                continue
+            grouped.setdefault(value, []).append(element)
+
+        for value, grouped_elements in sorted(grouped.items()):
+            grouped_elements.sort(key=lambda item: (str(item.get("path", "")), str(item.get("ref", ""))))
+            refs = [str(item.get("ref", "")) for item in grouped_elements if item.get("ref")]
+            summary = {
+                "count": len(grouped_elements),
+                "refs": refs,
+                "elements": [
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "ref",
+                            "id",
+                            "screen_id",
+                            "semantic_id",
+                            "label",
+                            "path",
+                            "resource_id",
+                            "text",
+                            "content_desc",
+                            "class_name",
+                            "type",
+                        )
+                    }
+                    for item in grouped_elements
+                ],
+            }
+            dictionary[field][value] = summary
+            if len(grouped_elements) > 1:
+                ambiguous.append({"field": field, "value": value, "count": len(grouped_elements), "refs": refs})
+
+    return {"tree_hash": snapshot.get("tree_hash"), "dictionary": dictionary, "ambiguous": ambiguous}
 
 
 def _resolve_snapshot_options(
@@ -330,7 +549,18 @@ def _find_elements(
     exact: bool = False,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    search_fields = ("id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type")
+    search_fields = ("semantic_id", "id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type")
+    field_priority = {
+        "semantic_id": 0,
+        "id": 1,
+        "resource_id": 2,
+        "label": 3,
+        "text": 4,
+        "content_desc": 5,
+        "ref": 6,
+        "class_name": 7,
+        "type": 8,
+    }
     if field != "any":
         if field not in search_fields:
             raise ValueError(f"unsupported find field: {field}")
@@ -346,7 +576,11 @@ def _find_elements(
         best_field = ""
         for candidate_field in selected_fields:
             score = _score_text_match(query, str(element.get(candidate_field, "")), exact=exact)
-            if score > best_score:
+            if score > best_score or (
+                score == best_score
+                and score > 0
+                and field_priority.get(candidate_field, 99) < field_priority.get(best_field, 99)
+            ):
                 best_score = score
                 best_field = candidate_field
         if best_score <= 0:
@@ -359,6 +593,7 @@ def _find_elements(
     results.sort(
         key=lambda item: (
             -int(item.get("match_score", 0)),
+            field_priority.get(str(item.get("match_field", "")), 99),
             str(item.get("path", "")),
             str(item.get("ref", "")),
         )
@@ -566,13 +801,73 @@ def _tool_device_find(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
     return False, payload
 
 
-def _tool_device_press(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+def _tool_device_page_map(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
     _ = runner
-    element = _expect_str(arguments, "element")
+    refresh = bool(_optional_bool(arguments, "refresh") or False)
     session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
     assert session is not None
 
-    selector = _selector_from_value(element, session.platform)
+    snapshot, cache_hit = _cached_snapshot(session, interactive=True, compact=True, refresh=refresh)
+    result_json = _build_page_map(snapshot)
+    if persist_session:
+        _save_session_to_file(session_path, session)
+
+    payload = {
+        "command": ["device_page_map"],
+        "env_overrides": {"DISPATCH_COMMANDS": "1" if session.dispatch_commands else "0"},
+        "exit_code": 0,
+        "stdout": json.dumps(result_json, ensure_ascii=True),
+        "stderr": "",
+        "result_json": result_json,
+        "cache_hit": cache_hit,
+        "session_file": str(session_path),
+        "persist_session": persist_session,
+    }
+    return False, payload
+
+
+def _tool_device_element_dictionary(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    _ = runner
+    refresh = bool(_optional_bool(arguments, "refresh") or False)
+    fields_value = arguments.get("fields")
+    fields: list[str] | None = None
+    if fields_value is not None:
+        if not isinstance(fields_value, list) or not all(isinstance(item, str) and item for item in fields_value):
+            raise ValueError("'fields' must be an array of non-empty strings when provided")
+        fields = list(fields_value)
+    session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
+    assert session is not None
+
+    snapshot, cache_hit = _cached_snapshot(session, interactive=True, compact=True, refresh=refresh)
+    result_json = _build_element_dictionary(snapshot, fields=fields)
+    if persist_session:
+        _save_session_to_file(session_path, session)
+
+    payload = {
+        "command": ["device_element_dictionary"],
+        "env_overrides": {"DISPATCH_COMMANDS": "1" if session.dispatch_commands else "0"},
+        "exit_code": 0,
+        "stdout": json.dumps(result_json, ensure_ascii=True),
+        "stderr": "",
+        "result_json": result_json,
+        "cache_hit": cache_hit,
+        "session_file": str(session_path),
+        "persist_session": persist_session,
+    }
+    return False, payload
+
+
+def _tool_device_press(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
+    _ = runner
+    session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
+    assert session is not None
+
+    selector, selector_supplied = _selector_from_arguments(arguments, session.platform)
+    ambiguity_mode, candidate_limit = _selector_options(arguments, selector_supplied=selector_supplied)
+    if ambiguity_mode is not None:
+        selector["ambiguity_mode"] = ambiguity_mode
+    if candidate_limit is not None:
+        selector["candidate_limit"] = candidate_limit
     cached_elements = _cached_elements(session)
     result = session.driver.interact({"action": "tap", "selector": selector}, elements=cached_elements)
     if result.get("status") not in {"error", "fail"}:
@@ -580,9 +875,10 @@ def _tool_device_press(arguments: dict[str, Any], runner: Runner) -> tuple[bool,
     if persist_session:
         _save_session_to_file(session_path, session)
     result_json = {"status": "ok", "operation": "press", "result": result}
+    command_target = selector.get("value")
 
     payload = {
-        "command": ["device_press", element],
+        "command": ["device_press", str(command_target)],
         "env_overrides": {"DISPATCH_COMMANDS": "1" if session.dispatch_commands else "0"},
         "exit_code": 0,
         "stdout": json.dumps(result_json, ensure_ascii=True),
@@ -596,12 +892,16 @@ def _tool_device_press(arguments: dict[str, Any], runner: Runner) -> tuple[bool,
 
 def _tool_device_fill(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
     _ = runner
-    element = _expect_str(arguments, "element")
     text = _expect_str(arguments, "text")
     session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
     assert session is not None
 
-    selector = _selector_from_value(element, session.platform)
+    selector, selector_supplied = _selector_from_arguments(arguments, session.platform)
+    ambiguity_mode, candidate_limit = _selector_options(arguments, selector_supplied=selector_supplied)
+    if ambiguity_mode is not None:
+        selector["ambiguity_mode"] = ambiguity_mode
+    if candidate_limit is not None:
+        selector["candidate_limit"] = candidate_limit
     cached_elements = _cached_elements(session)
     result = session.driver.interact(
         {"action": "input_text", "selector": selector, "text": text},
@@ -612,9 +912,10 @@ def _tool_device_fill(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
     if persist_session:
         _save_session_to_file(session_path, session)
     result_json = {"status": "ok", "operation": "fill", "result": result}
+    command_target = selector.get("value")
 
     payload = {
-        "command": ["device_fill", element],
+        "command": ["device_fill", str(command_target)],
         "env_overrides": {"DISPATCH_COMMANDS": "1" if session.dispatch_commands else "0"},
         "exit_code": 0,
         "stdout": json.dumps(result_json, ensure_ascii=True),
@@ -628,21 +929,26 @@ def _tool_device_fill(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
 
 def _tool_device_verify(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
     _ = runner
-    element = _expect_str(arguments, "element")
     expected = _expect_str(arguments, "expected")
     timeout_ms = _optional_int(arguments, "timeout_ms")
     session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
     assert session is not None
 
-    selector = _selector_from_value(element, session.platform)
+    selector, selector_supplied = _selector_from_arguments(arguments, session.platform)
+    ambiguity_mode, candidate_limit = _selector_options(arguments, selector_supplied=selector_supplied)
+    if ambiguity_mode is not None:
+        selector["ambiguity_mode"] = ambiguity_mode
+    if candidate_limit is not None:
+        selector["candidate_limit"] = candidate_limit
     assertion = {"action": "assert_visible", "selector": selector, "timeout_ms": timeout_ms or 5000, "value": expected}
     result = session.driver.verify(assertion)
     if persist_session:
         _save_session_to_file(session_path, session)
     result_json = {"status": "ok", "operation": "verify", "result": result}
+    command_target = selector.get("value")
 
     payload = {
-        "command": ["device_verify", element],
+        "command": ["device_verify", str(command_target)],
         "env_overrides": {"DISPATCH_COMMANDS": "1" if session.dispatch_commands else "0"},
         "exit_code": 0,
         "stdout": json.dumps(result_json, ensure_ascii=True),
@@ -665,6 +971,8 @@ TOOL_HANDLERS: dict[str, Callable[[dict[str, Any], Runner], tuple[bool, dict[str
     "device_snapshot": _tool_device_snapshot,
     "device_list": _tool_device_list,
     "device_find": _tool_device_find,
+    "device_page_map": _tool_device_page_map,
+    "device_element_dictionary": _tool_device_element_dictionary,
     "device_press": _tool_device_press,
     "device_fill": _tool_device_fill,
     "device_verify": _tool_device_verify,
@@ -807,7 +1115,7 @@ def tool_schemas() -> list[dict[str, Any]]:
                     "query": {"type": "string"},
                     "field": {
                         "type": "string",
-                        "enum": ["any", "id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type"],
+                        "enum": ["any", "semantic_id", "id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type"],
                     },
                     "exact": {"type": "boolean"},
                     "limit": {"type": "integer"},
@@ -821,50 +1129,90 @@ def tool_schemas() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "device_page_map",
+            "description": "Build a current-screen page map from the interactive session snapshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_file": {"type": "string"},
+                    "refresh": {"type": "boolean"},
+                    "dispatch_commands": {"type": "boolean"},
+                    "persist_session": {"type": "boolean"},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "device_element_dictionary",
+            "description": "Build a current-screen element dictionary grouped by stable text and id fields.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "fields": {"type": "array", "items": {"type": "string"}},
+                    "session_file": {"type": "string"},
+                    "refresh": {"type": "boolean"},
+                    "dispatch_commands": {"type": "boolean"},
+                    "persist_session": {"type": "boolean"},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "device_press",
-            "description": "Tap one element by id or @e reference in interactive session.",
+            "description": "Tap one element by legacy id/ref or by structured selector in interactive session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "element": {"type": "string"},
+                    "selector": {"type": "object"},
+                    "ambiguity_mode": {"type": "string", "enum": ["first", "error"]},
+                    "candidate_limit": {"type": "integer"},
                     "session_file": {"type": "string"},
                     "dispatch_commands": {"type": "boolean"},
                     "persist_session": {"type": "boolean"},
                 },
-                "required": ["element"],
+                "required": [],
                 "additionalProperties": False,
             },
         },
         {
             "name": "device_fill",
-            "description": "Input text into an element in interactive session.",
+            "description": "Input text into an element in interactive session using a legacy id/ref or structured selector.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "element": {"type": "string"},
+                    "selector": {"type": "object"},
                     "text": {"type": "string"},
+                    "ambiguity_mode": {"type": "string", "enum": ["first", "error"]},
+                    "candidate_limit": {"type": "integer"},
                     "session_file": {"type": "string"},
                     "dispatch_commands": {"type": "boolean"},
                     "persist_session": {"type": "boolean"},
                 },
-                "required": ["element", "text"],
+                "required": ["text"],
                 "additionalProperties": False,
             },
         },
         {
             "name": "device_verify",
-            "description": "Verify one element is visible in interactive session.",
+            "description": "Verify one element is visible in interactive session using a legacy id/ref or structured selector.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "element": {"type": "string"},
+                    "selector": {"type": "object"},
                     "expected": {"type": "string"},
                     "timeout_ms": {"type": "integer"},
+                    "ambiguity_mode": {"type": "string", "enum": ["first", "error"]},
+                    "candidate_limit": {"type": "integer"},
                     "session_file": {"type": "string"},
                     "dispatch_commands": {"type": "boolean"},
                     "persist_session": {"type": "boolean"},
                 },
-                "required": ["element", "expected"],
+                "required": ["expected"],
                 "additionalProperties": False,
             },
         },

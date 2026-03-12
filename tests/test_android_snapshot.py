@@ -62,6 +62,53 @@ class TestAndroidSnapshot(unittest.TestCase):
         self.assertTrue(snapshot["normalization_report"]["compact_requested"])
         self.assertEqual([element["id"] for element in snapshot["elements"]], ["cta"])
 
+    def test_bridge_normalization_preserves_semantic_and_screen_ids(self) -> None:
+        driver = AndroidDriver(app={"android_package": "com.example.app"}, dispatch_commands=True)
+        capture = {
+            "status": "ok",
+            "request_id": "bridge-semantic",
+            "latency_ms": 7,
+            "capture_trace": {"request_payload": {"interactive_only": False, "compact": True}},
+            "payload": {
+                "protocol_version": "bridge.v1",
+                "screen_id": "settings",
+                "root": "screen.settings",
+                "nodes": [
+                    {
+                        "node_id": "screen.settings",
+                        "parent_id": None,
+                        "class_name": "android.view.View",
+                        "resource_id": "screen.settings",
+                        "screen_id": "settings",
+                        "label": "Settings",
+                        "content_desc": "Settings",
+                        "bounds": [0, 0, 100, 100],
+                        "clickable": False,
+                    },
+                    {
+                        "node_id": "settings.summary_tile",
+                        "parent_id": "screen.settings",
+                        "class_name": "android.widget.Button",
+                        "resource_id": "settings.summary_tile",
+                        "semantic_id": "settings.summary_tile",
+                        "screen_id": "settings",
+                        "label": "Summary",
+                        "text": "Summary",
+                        "bounds": [0, 0, 50, 20],
+                        "clickable": True,
+                        "index_in_parent": 0,
+                    },
+                ],
+            },
+        }
+
+        snapshot = driver._normalize_bridge_snapshot(capture, {"interactive_only": False, "compact": True})
+
+        self.assertEqual(snapshot["screen_id"], "settings")
+        self.assertEqual(snapshot["elements"][0]["screen_id"], "settings")
+        self.assertEqual(snapshot["elements"][1]["semantic_id"], "settings.summary_tile")
+        self.assertEqual(snapshot["elements"][1]["label"], "Summary")
+
     def test_lightweight_snapshot_falls_back_to_adb_explicitly(self) -> None:
         driver = AndroidDriver(app={"android_package": "com.example.app"}, dispatch_commands=True)
         calls: list[str] = []
