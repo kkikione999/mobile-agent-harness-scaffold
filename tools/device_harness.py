@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -190,6 +191,24 @@ def _selector_from_value(value: str, platform: str) -> dict[str, Any]:
     return make_selector(by="id", value=value, platform_hint=platform)
 
 
+def _retry_android_preflight(
+    driver: AndroidDriver | IOSDriver,
+    *,
+    timeout_ms: int = 6000,
+    poll_ms: int = 500,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    last = driver.preflight()
+    while (
+        isinstance(driver, AndroidDriver)
+        and last.get("status") in {"error", "fail"}
+        and int((time.monotonic() - started) * 1000) < timeout_ms
+    ):
+        time.sleep(max(poll_ms, 0) / 1000.0)
+        last = driver.preflight()
+    return last
+
+
 def cmd_open(args: argparse.Namespace) -> None:
     dispatch_commands = os.getenv("DISPATCH_COMMANDS", "0") == "1"
     if args.platform == "android":
@@ -200,7 +219,7 @@ def cmd_open(args: argparse.Namespace) -> None:
         driver = IOSDriver(app=app, dispatch_commands=dispatch_commands)
 
     launch = driver.interact({"action": "launch_app"})
-    preflight = driver.preflight()
+    preflight = _retry_android_preflight(driver)
     session = {
         "platform": args.platform,
         "app": app,
@@ -209,8 +228,19 @@ def cmd_open(args: argparse.Namespace) -> None:
         "snapshot_cache": {},
     }
     _save_session(Path(args.session_file), session)
+    launch_failed = launch.get("status") in {"error", "fail"}
+    if (
+        args.platform == "android"
+        and launch.get("command")
+        and "monkey -p" in str(launch.get("command"))
+        and int(launch.get("returncode", -1)) == 251
+        and preflight.get("status") == "ok"
+    ):
+        launch_failed = False
+        launch["status"] = "ok"
+        launch["details"] = "monkey returned 251 but app launch verified by bridge preflight"
     status = "ok"
-    if launch.get("status") in {"error", "fail"} or preflight.get("status") in {"error", "fail"}:
+    if launch_failed or preflight.get("status") in {"error", "fail"}:
         status = "error"
     print(
         json.dumps(
