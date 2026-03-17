@@ -68,16 +68,92 @@ class TestAndroidSnapshot(unittest.TestCase):
         self.assertEqual(bridge_calls, [("com.example.app", {"interactive_only": True, "compact": True})])
         self.assertEqual(snapshot["capture_source"], "android_accessibility_bridge")
         self.assertEqual(snapshot["snapshot_health"]["status"], "healthy")
-        self.assertEqual(snapshot["snapshot_request"], {"interactive_only": True, "compact": True})
+        self.assertEqual(
+            snapshot["snapshot_request"],
+            {"interactive_only": True, "compact": True, "bridge_first_full": False},
+        )
         self.assertTrue(snapshot["normalization_report"]["interactive_only_applied"])
         self.assertEqual(snapshot["normalization_report"]["interactive_only_mode"], "projection")
         self.assertTrue(snapshot["normalization_report"]["compact_requested"])
+        self.assertFalse(snapshot["normalization_report"]["bridge_first_full_requested"])
         self.assertTrue(snapshot["normalization_report"]["authoritative_root_preserved"])
         self.assertEqual(snapshot["root"], snapshot["elements"][0]["ref"])
         self.assertEqual([element["id"] for element in snapshot["elements"]], ["root", "content", "cta"])
         self.assertEqual(snapshot["interactive_projection"]["authoritative_root"], snapshot["root"])
         self.assertEqual(snapshot["interactive_projection"]["element_ids"], ["cta"])
         self.assertEqual(snapshot["interactive_projection"]["root"], snapshot["elements"][-1]["ref"])
+
+    def test_bridge_first_full_snapshot_prefers_bridge_without_adb_fallback(self) -> None:
+        driver = AndroidDriver(app={"android_package": "com.example.app"}, dispatch_commands=True)
+        bridge_capture = {
+            "status": "ok",
+            "request_id": "bridge-full-1",
+            "latency_ms": 9,
+            "capture_trace": {
+                "request_payload": {"interactive_only": False, "compact": False, "bridge_first_full": True}
+            },
+            "payload": {
+                "protocol_version": "bridge.v1",
+                "screen_id": "screen.settings",
+                "root": "screen.settings",
+                "nodes": [
+                    {
+                        "node_id": "screen.settings",
+                        "parent_id": None,
+                        "class_name": "android.view.View",
+                        "resource_id": "screen.settings",
+                        "screen_id": "screen.settings",
+                        "label": "Settings",
+                        "content_desc": "Settings",
+                        "bounds": [0, 0, 100, 100],
+                        "clickable": False,
+                    },
+                    {
+                        "node_id": "settings.search",
+                        "parent_id": "screen.settings",
+                        "class_name": "android.widget.EditText",
+                        "resource_id": "settings.search",
+                        "semantic_id": "settings.search",
+                        "screen_id": "screen.settings",
+                        "text": "Search",
+                        "bounds": [0, 0, 50, 20],
+                        "focusable": True,
+                        "editable": True,
+                        "index_in_parent": 0,
+                    },
+                ],
+            },
+        }
+
+        bridge_calls: list[tuple[str, dict[str, bool]]] = []
+
+        def bridge_snapshot(*, app_package: str, options: dict[str, bool]) -> dict[str, object]:
+            bridge_calls.append((app_package, dict(options)))
+            return bridge_capture
+
+        driver._bridge.snapshot = bridge_snapshot  # type: ignore[method-assign]
+
+        def unexpected_adb() -> dict[str, object]:
+            raise AssertionError("ADB should not run for bridge-first full snapshot success")
+
+        driver._adb_snapshot = unexpected_adb  # type: ignore[method-assign]
+
+        snapshot = driver.snapshot({"interactive_only": False, "compact": False, "bridge_first_full": True})
+
+        self.assertEqual(
+            bridge_calls,
+            [("com.example.app", {"interactive_only": False, "compact": False, "bridge_first_full": True})],
+        )
+        self.assertEqual(snapshot["capture_source"], "android_accessibility_bridge")
+        self.assertEqual(snapshot["snapshot_health"]["status"], "healthy")
+        self.assertEqual(
+            snapshot["snapshot_request"],
+            {"interactive_only": False, "compact": False, "bridge_first_full": True},
+        )
+        self.assertTrue(snapshot["normalization_report"]["bridge_first_full_requested"])
+        self.assertEqual(snapshot["screen_id"], "screen.settings")
+        self.assertEqual(snapshot["interactive_projection"]["authoritative_root"], snapshot["root"])
+        self.assertEqual(snapshot["elements"][1]["semantic_id"], "settings.search")
 
     def test_bridge_normalization_keeps_only_the_active_scope_for_mixed_screens(self) -> None:
         driver = AndroidDriver(app={"android_package": "com.example.app"}, dispatch_commands=True)
@@ -197,7 +273,10 @@ class TestAndroidSnapshot(unittest.TestCase):
         self.assertEqual(snapshot["snapshot_health"]["status"], "degraded")
         self.assertEqual(snapshot["snapshot_health"]["reason"], "bridge_unreachable")
         self.assertEqual(snapshot["capture_error"]["error_code"], "bridge_unreachable")
-        self.assertEqual(snapshot["snapshot_request"], {"interactive_only": True, "compact": True})
+        self.assertEqual(
+            snapshot["snapshot_request"],
+            {"interactive_only": True, "compact": True, "bridge_first_full": False},
+        )
         self.assertEqual(snapshot["root"], snapshot["elements"][0]["ref"])
         self.assertEqual([element["id"] for element in snapshot["elements"]], ["root", "cta"])
         self.assertEqual(snapshot["interactive_projection"]["element_ids"], ["cta"])
@@ -231,7 +310,10 @@ class TestAndroidSnapshot(unittest.TestCase):
         self.assertEqual(snapshot["snapshot_health"]["reason"], "bridge_timeout")
         self.assertEqual(snapshot["capture_error"]["error_code"], "bridge_timeout")
         self.assertEqual(snapshot["capture_error"]["adb_error_code"], "adb_timeout")
-        self.assertEqual(snapshot["snapshot_request"], {"interactive_only": True, "compact": True})
+        self.assertEqual(
+            snapshot["snapshot_request"],
+            {"interactive_only": True, "compact": True, "bridge_first_full": False},
+        )
         self.assertIn("bridge_snapshot", snapshot["capture_trace"])
         self.assertIn("adb_snapshot", snapshot["capture_trace"])
 

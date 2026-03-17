@@ -34,6 +34,7 @@ class _RecordingDriver:
         self.app = app
         self.dispatch_commands = dispatch_commands
         self.snapshot_calls: list[dict[str, bool]] = []
+        self.raw_snapshot_calls: list[dict[str, Any]] = []
         self.state: dict[str, Any] = {}
 
     def preflight(self) -> dict[str, Any]:
@@ -46,6 +47,7 @@ class _RecordingDriver:
         return {"status": "ok", "action": action.get("action")}
 
     def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.raw_snapshot_calls.append(dict(options or {}))
         resolved = {
             "interactive_only": bool((options or {}).get("interactive_only", False)),
             "compact": bool((options or {}).get("compact", False)),
@@ -1028,6 +1030,7 @@ class TestMCPServer(unittest.TestCase):
                 )
                 self.assertIsNotNone(open_response)
                 mcp_server.DEVICE_SESSION_CACHE[session_file].snapshot_cache.clear()
+                driver.raw_snapshot_calls.clear()
 
                 fill_response = server.handle_message(
                     {
@@ -1056,6 +1059,17 @@ class TestMCPServer(unittest.TestCase):
             self.assertTrue(result["retry_context"]["semantic_retry_preserved"])
             self.assertTrue(result["retry_context"]["full_snapshot"]["live_semantics_ready"])
             self.assertEqual(result_json["settlement"]["status"], "settled")
+            self.assertEqual(
+                driver.raw_snapshot_calls[0],
+                {"interactive_only": False, "compact": False, "bridge_first_full": True},
+            )
+            self.assertEqual(
+                driver.raw_snapshot_calls[1:],
+                [
+                    {"interactive_only": False, "compact": False},
+                    {"interactive_only": False, "compact": False},
+                ],
+            )
 
     def test_device_fill_reports_degraded_retry_when_full_snapshot_falls_back(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mcp-device-fill-fallback-retry-") as tmp:
@@ -1182,6 +1196,14 @@ class TestMCPServer(unittest.TestCase):
             self.assertEqual(open_result["settlement"]["screen_id"], "screen.settings")
             self.assertTrue(open_result["settlement"]["snapshot"]["live_semantics_ready"])
             self.assertFalse(open_result["settlement"]["degraded"])
+            self.assertEqual(
+                driver.raw_snapshot_calls,
+                [
+                    {"interactive_only": False, "compact": False, "bridge_first_full": True},
+                    {"interactive_only": False, "compact": False, "bridge_first_full": True},
+                    {"interactive_only": False, "compact": False, "bridge_first_full": True},
+                ],
+            )
 
             self.assertIsNotNone(page_map_response)
             page_map_result = page_map_response["result"]["structuredContent"]  # type: ignore[index]

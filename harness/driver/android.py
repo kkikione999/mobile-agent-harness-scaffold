@@ -48,7 +48,7 @@ class AndroidDriver(DeviceHarness):
         if not self.dispatch_commands:
             return super().snapshot(options)
 
-        if self._lightweight_snapshot_requested(options):
+        if self._bridge_first_snapshot_requested(options):
             capture = self._bridge.snapshot(app_package=self.app_identity(), options=options)
             if capture.get("status") == "ok":
                 raw_payload = capture.get("payload")
@@ -99,12 +99,18 @@ class AndroidDriver(DeviceHarness):
         return {
             "interactive_only": AndroidDriver._to_bool(options.get("interactive_only"), False),
             "compact": AndroidDriver._to_bool(options.get("compact"), False),
+            "bridge_first_full": AndroidDriver._to_bool(options.get("bridge_first_full"), False),
         }
 
     @classmethod
     def _lightweight_snapshot_requested(cls, options: dict[str, Any] | None = None) -> bool:
         request = cls._snapshot_request_metadata(options)
         return request["interactive_only"] or request["compact"]
+
+    @classmethod
+    def _bridge_first_snapshot_requested(cls, options: dict[str, Any] | None = None) -> bool:
+        request = cls._snapshot_request_metadata(options)
+        return request["interactive_only"] or request["compact"] or request["bridge_first_full"]
 
     def _apply_snapshot_request(self, snapshot: dict[str, Any], options: dict[str, Any] | None = None) -> dict[str, Any]:
         request = self._snapshot_request_metadata(options)
@@ -115,6 +121,7 @@ class AndroidDriver(DeviceHarness):
             report = {}
         report["interactive_only_requested"] = request["interactive_only"]
         report["compact_requested"] = request["compact"]
+        report["bridge_first_full_requested"] = request["bridge_first_full"]
 
         interactive_elements = [
             element
