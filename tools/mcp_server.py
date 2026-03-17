@@ -714,6 +714,26 @@ def _seed_snapshot_cache(session: DeviceSession, snapshot: dict[str, Any], optio
         session.snapshot_cache[options] = snapshot
 
 
+def _settlement_result(
+    *,
+    status: str,
+    attempts: int,
+    elapsed_ms: int,
+    stable_observations: int,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "attempts": attempts,
+        "elapsed_ms": elapsed_ms,
+        "stable_observations": stable_observations,
+        "tree_hash": snapshot.get("tree_hash"),
+        "screen_id": snapshot.get("screen_id"),
+        "root": snapshot.get("root"),
+        "snapshot": snapshot,
+    }
+
+
 def _selector_retry_context(selector: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
     selector_value = selector.get("value")
     probe = selector_value.strip() if isinstance(selector_value, str) else ""
@@ -758,9 +778,9 @@ def _selector_retry_context(selector: dict[str, Any], snapshot: dict[str, Any]) 
     }
 
 
-def _poll_driver_settlement(driver: Any) -> dict[str, Any]:
+def _poll_driver_settlement(driver: Any, *, prefer_live_semantics: bool = False) -> dict[str, Any]:
     settle = getattr(driver, "wait_for_state_settle", None)
-    if callable(settle):
+    if callable(settle) and not prefer_live_semantics:
         return settle(
             timeout_ms=SETTLEMENT_TIMEOUT_MS,
             poll_ms=SETTLEMENT_POLL_MS,
@@ -773,6 +793,8 @@ def _poll_driver_settlement(driver: Any) -> dict[str, Any]:
     observed_stable = 0
     previous_fingerprint: tuple[Any, ...] | None = None
     last_snapshot: dict[str, Any] = {}
+    stable_semantic_snapshot: dict[str, Any] | None = None
+    stable_semantic_observations = 0
     while True:
         snapshot = driver.snapshot({"interactive_only": False, "compact": False})
         last_snapshot = snapshot if isinstance(snapshot, dict) else {}
@@ -792,28 +814,41 @@ def _poll_driver_settlement(driver: Any) -> dict[str, Any]:
         previous_fingerprint = fingerprint
 
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        if observed_stable >= SETTLEMENT_STABLE_OBSERVATIONS:
-            return {
-                "status": "settled",
-                "attempts": attempts,
-                "elapsed_ms": elapsed_ms,
-                "stable_observations": observed_stable,
-                "tree_hash": last_snapshot.get("tree_hash"),
-                "screen_id": last_snapshot.get("screen_id"),
-                "root": last_snapshot.get("root"),
-                "snapshot": last_snapshot,
-            }
+        snapshot_summary = _snapshot_introspection(last_snapshot) if last_snapshot else {}
+        if bool(snapshot_summary.get("live_semantics_ready")) and observed_stable >= SETTLEMENT_STABLE_OBSERVATIONS:
+            stable_semantic_snapshot = last_snapshot
+            stable_semantic_observations = observed_stable
+            return _settlement_result(
+                status="settled",
+                attempts=attempts,
+                elapsed_ms=elapsed_ms,
+                stable_observations=observed_stable,
+                snapshot=last_snapshot,
+            )
+        if not prefer_live_semantics and observed_stable >= SETTLEMENT_STABLE_OBSERVATIONS:
+            return _settlement_result(
+                status="settled",
+                attempts=attempts,
+                elapsed_ms=elapsed_ms,
+                stable_observations=observed_stable,
+                snapshot=last_snapshot,
+            )
         if elapsed_ms >= SETTLEMENT_TIMEOUT_MS:
-            return {
-                "status": "timeout",
-                "attempts": attempts,
-                "elapsed_ms": elapsed_ms,
-                "stable_observations": observed_stable,
-                "tree_hash": last_snapshot.get("tree_hash"),
-                "screen_id": last_snapshot.get("screen_id"),
-                "root": last_snapshot.get("root"),
-                "snapshot": last_snapshot,
-            }
+            if isinstance(stable_semantic_snapshot, dict):
+                return _settlement_result(
+                    status="settled",
+                    attempts=attempts,
+                    elapsed_ms=elapsed_ms,
+                    stable_observations=stable_semantic_observations,
+                    snapshot=stable_semantic_snapshot,
+                )
+            return _settlement_result(
+                status="timeout",
+                attempts=attempts,
+                elapsed_ms=elapsed_ms,
+                stable_observations=observed_stable,
+                snapshot=last_snapshot,
+            )
 
         remaining_seconds = max(0.0, (SETTLEMENT_TIMEOUT_MS - elapsed_ms) / 1000.0)
         sleep_seconds = min(max(SETTLEMENT_POLL_MS, 0) / 1000.0, remaining_seconds)
@@ -821,8 +856,8 @@ def _poll_driver_settlement(driver: Any) -> dict[str, Any]:
             time.sleep(sleep_seconds)
 
 
-def _settle_action(session: DeviceSession, operation: str) -> dict[str, Any]:
-    settle_result = _poll_driver_settlement(session.driver)
+def _settle_action(session: DeviceSession, operation: str, *, prefer_live_semantics: bool = False) -> dict[str, Any]:
+    settle_result = _poll_driver_settlement(session.driver, prefer_live_semantics=prefer_live_semantics)
     snapshot = settle_result.get("snapshot")
     snapshot_summary = _snapshot_introspection(snapshot) if isinstance(snapshot, dict) else {}
     if isinstance(snapshot, dict):
@@ -1073,6 +1108,19 @@ def _device_session(arguments: dict[str, Any], require_existing: bool = True) ->
     return session, cache_key, session_path, persist_session, dispatch_override
 
 
+def _preflight_prefers_semantic_settlement(preflight: dict[str, Any]) -> bool:
+    bridge = preflight.get("bridge")
+    if isinstance(bridge, dict):
+        bridge_status = str(bridge.get("status", "")).strip().lower()
+        if bridge_status in {"healthy", "ok", "ready", "connected"}:
+            return True
+        if bridge_status in {"error", "fail", "degraded", "offline", "disconnected"}:
+            return False
+
+    bridge_status = str(preflight.get("bridge_status", "")).strip().lower()
+    return bridge_status in {"healthy", "ok", "ready", "connected"}
+
+
 def _tool_device_open(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
     _ = runner
     platform = _expect_str(arguments, "platform")
@@ -1100,7 +1148,11 @@ def _tool_device_open(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
     DEVICE_SESSION_CACHE[cache_key] = session
     settlement: dict[str, Any] | None = None
     if launch.get("status") not in {"error", "fail"} and preflight.get("status") not in {"error", "fail"}:
-        settlement = _settle_action(session, "open")
+        settlement = _settle_action(
+            session,
+            "open",
+            prefer_live_semantics=_preflight_prefers_semantic_settlement(preflight),
+        )
     if persist_session:
         _save_session_to_file(session_path, session)
 
