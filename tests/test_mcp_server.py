@@ -280,6 +280,35 @@ class _WarmLaunchSemanticRecoveryDriver(_SemanticRecordingDriver):
         }
 
 
+class _PostActionSemanticSettlementDriver(_WarmLaunchSemanticRecoveryDriver):
+    def __init__(self, app: dict[str, Any], dispatch_commands: bool) -> None:
+        super().__init__(app=app, dispatch_commands=dispatch_commands)
+        self.wait_for_state_settle_calls = 0
+
+    def wait_for_state_settle(
+        self,
+        *,
+        timeout_ms: int,
+        poll_ms: int,
+        stable_observations: int,
+        snapshot_options: dict[str, Any],
+    ) -> dict[str, Any]:
+        _ = (poll_ms, stable_observations)
+        self.wait_for_state_settle_calls += 1
+        degraded = self._fallback_snapshot(snapshot_options)
+        degraded["tree_hash"] = "post-action-degraded"
+        return {
+            "status": "settled",
+            "attempts": 1,
+            "elapsed_ms": timeout_ms,
+            "stable_observations": 1,
+            "tree_hash": degraded.get("tree_hash"),
+            "screen_id": degraded.get("screen_id"),
+            "root": degraded.get("root"),
+            "snapshot": degraded,
+        }
+
+
 class _AmbiguousSelectorDriver(DeviceHarness):
     def __init__(self, app: dict[str, Any], dispatch_commands: bool) -> None:
         super().__init__(platform="android", app=app, dispatch_commands=dispatch_commands)
@@ -383,6 +412,71 @@ class _AmbiguousSelectorDriver(DeviceHarness):
 class TestMCPServer(unittest.TestCase):
     def setUp(self) -> None:
         mcp_server.DEVICE_SESSION_CACHE.clear()
+
+    def _assert_post_action_settlement_stays_semantic(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix=f"mcp-{tool_name}-semantic-settle-") as tmp:
+            session_file = str(Path(tmp) / "session.json")
+            server = mcp_server.MCPServer(runner=_FailRunner())
+            driver = _PostActionSemanticSettlementDriver(
+                app={"android_package": "com.example.app"},
+                dispatch_commands=False,
+            )
+
+            with mock.patch("tools.mcp_server._build_device_driver", return_value=driver):
+                open_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 127,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "device_open",
+                            "arguments": {
+                                "platform": "android",
+                                "app": "com.example.app",
+                                "dispatch_commands": False,
+                                "session_file": session_file,
+                            },
+                        },
+                    }
+                )
+                self.assertIsNotNone(open_response)
+                self.assertFalse(open_response["result"]["isError"])  # type: ignore[index]
+
+                driver.raw_snapshot_calls.clear()
+
+                action_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 128,
+                        "method": "tools/call",
+                        "params": {
+                            "name": tool_name,
+                            "arguments": {"session_file": session_file, **arguments},
+                        },
+                    }
+                )
+
+            self.assertIsNotNone(action_response)
+            self.assertFalse(action_response["result"]["isError"])  # type: ignore[index]
+            result_json = action_response["result"]["structuredContent"]["result_json"]  # type: ignore[index]
+            self.assertEqual(result_json["status"], "ok")
+            self.assertEqual(result_json["settlement"]["status"], "settled")
+            self.assertEqual(result_json["settlement"]["screen_id"], "screen.settings")
+            self.assertTrue(result_json["settlement"]["snapshot"]["live_semantics_ready"])
+            self.assertFalse(result_json["settlement"]["degraded"])
+            self.assertEqual(driver.wait_for_state_settle_calls, 0)
+            self.assertEqual(
+                driver.raw_snapshot_calls,
+                [
+                    {"interactive_only": False, "compact": False, "bridge_first_full": True},
+                    {"interactive_only": False, "compact": False, "bridge_first_full": True},
+                ],
+            )
 
     def test_tools_list_contains_core_tools(self) -> None:
         server = mcp_server.MCPServer()
@@ -1123,6 +1217,16 @@ class TestMCPServer(unittest.TestCase):
             self.assertTrue(result["retry_context"]["full_snapshot"]["degraded"])
             self.assertFalse(result["retry_context"]["semantic_retry_preserved"])
             self.assertIsNone(result_json["settlement"])
+
+    def test_device_press_and_fill_post_action_settlement_stays_semantic(self) -> None:
+        self._assert_post_action_settlement_stays_semantic(
+            tool_name="device_press",
+            arguments={"element": "search.query_input"},
+        )
+        self._assert_post_action_settlement_stays_semantic(
+            tool_name="device_fill",
+            arguments={"element": "search.query_input", "text": "hello"},
+        )
 
     def test_device_open_reports_settlement_timeout(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mcp-device-open-timeout-") as tmp:
