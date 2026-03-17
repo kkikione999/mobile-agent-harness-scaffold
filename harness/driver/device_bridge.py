@@ -200,12 +200,15 @@ class DeviceHarness(ABC):
             resolved, info = resolve_selector(selector, elements or [])
             selector_info = dict(info)
             if resolved is None:
+                match_type = str(selector_info.get("match_type", ""))
+                error_code = "ambiguous_selector" if match_type in {"ambiguous", "ambiguous_within"} else "selector_drift"
                 return {
                     "status": "error",
                     "details": f"selector not found: {selector}",
-                    "error_code": "selector_drift",
+                    "error_code": error_code,
                     "selector": selector,
                     "selector_info": selector_info,
+                    "candidates": selector_info.get("candidates", []),
                     "command": None,
                 }
             selector_info["resolved_ref"] = resolved.get("ref")
@@ -328,6 +331,62 @@ class DeviceHarness(ABC):
                 }
             )
         return {"status": "ok", "trace": trace}
+
+    def wait_for_state_settle(
+        self,
+        *,
+        timeout_ms: int = 1000,
+        poll_ms: int = 100,
+        stable_observations: int = 2,
+        snapshot_options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        attempts = 0
+        observed_stable = 0
+        previous_fingerprint: tuple[Any, ...] | None = None
+        last_snapshot: dict[str, Any] = {}
+
+        while True:
+            snapshot = self.snapshot(snapshot_options)
+            last_snapshot = snapshot if isinstance(snapshot, dict) else {}
+            attempts += 1
+            fingerprint = self._snapshot_fingerprint(last_snapshot)
+
+            if previous_fingerprint is not None and fingerprint == previous_fingerprint:
+                observed_stable += 1
+            else:
+                observed_stable = 1
+            previous_fingerprint = fingerprint
+
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            if observed_stable >= max(1, stable_observations):
+                return {
+                    "status": "settled",
+                    "attempts": attempts,
+                    "elapsed_ms": elapsed_ms,
+                    "stable_observations": observed_stable,
+                    "tree_hash": last_snapshot.get("tree_hash"),
+                    "screen_id": last_snapshot.get("screen_id"),
+                    "root": last_snapshot.get("root"),
+                    "snapshot": last_snapshot,
+                }
+
+            if elapsed_ms >= timeout_ms:
+                return {
+                    "status": "timeout",
+                    "attempts": attempts,
+                    "elapsed_ms": elapsed_ms,
+                    "stable_observations": observed_stable,
+                    "tree_hash": last_snapshot.get("tree_hash"),
+                    "screen_id": last_snapshot.get("screen_id"),
+                    "root": last_snapshot.get("root"),
+                    "snapshot": last_snapshot,
+                }
+
+            remaining_seconds = max(0.0, (timeout_ms - elapsed_ms) / 1000.0)
+            sleep_seconds = min(max(poll_ms, 0) / 1000.0, remaining_seconds)
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
 
     def dump_state(self) -> dict[str, Any]:
         return {
@@ -499,6 +558,17 @@ class DeviceHarness(ABC):
             ]
         )
         return build_ref("tree", {"id": material, "label": "", "type": "", "path": "", "ordinal": 0})
+
+    @staticmethod
+    def _snapshot_fingerprint(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+        elements = snapshot.get("elements", [])
+        element_count = len(elements) if isinstance(elements, list) else -1
+        return (
+            snapshot.get("tree_hash"),
+            snapshot.get("screen_id"),
+            snapshot.get("root"),
+            element_count,
+        )
 
     @staticmethod
     def _is_presence_expectation(expected: str) -> bool:

@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -29,6 +30,10 @@ Runner = Callable[[list[str], Optional[dict[str, str]]], CommandResult]
 DEFAULT_SESSION_FILE = ".device_harness_session.json"
 LIGHTWEIGHT_SNAPSHOT_OPTIONS = (True, True)
 SnapshotOptions = tuple[bool, bool]
+FULL_SNAPSHOT_OPTIONS = (False, False)
+SETTLEMENT_TIMEOUT_MS = 1000
+SETTLEMENT_POLL_MS = 100
+SETTLEMENT_STABLE_OBSERVATIONS = 2
 
 
 @dataclass
@@ -275,15 +280,19 @@ def _selector_from_payload(value: Any, platform: str) -> dict[str, Any]:
         if candidate_limit <= 0:
             raise ValueError("'selector.candidate_limit' must be greater than 0")
 
-    return make_selector(
+    selector = make_selector(
         by=by,
         value=target_value,
         within=within,
         platform_hint=platform,
-        anchor=anchor,
-        ambiguity_mode=ambiguity_mode,
-        candidate_limit=candidate_limit,
     )
+    if anchor is not None:
+        selector["anchor"] = anchor
+    if ambiguity_mode is not None:
+        selector["ambiguity_mode"] = ambiguity_mode
+    if candidate_limit is not None:
+        selector["candidate_limit"] = candidate_limit
+    return selector
 
 
 def _selector_from_arguments(arguments: dict[str, Any], platform: str) -> tuple[dict[str, Any], bool]:
@@ -336,34 +345,186 @@ def _compact_elements(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     return compact
 
 
+def _snapshot_elements(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    elements = snapshot.get("elements", [])
+    if not isinstance(elements, list):
+        return []
+    return [element for element in elements if isinstance(element, dict)]
+
+
+def _path_depth(path: Any) -> int:
+    text = str(path).strip()
+    if not text:
+        return 9999
+    return text.count("/")
+
+
+def _snapshot_root_ref(snapshot: dict[str, Any]) -> str | None:
+    root_ref = snapshot.get("root")
+    if isinstance(root_ref, str) and root_ref.strip():
+        return root_ref.strip()
+    return None
+
+
 def _snapshot_screen_id(snapshot: dict[str, Any]) -> str | None:
     screen_id = snapshot.get("screen_id")
     if isinstance(screen_id, str) and screen_id:
         return screen_id
-    elements = snapshot.get("elements", [])
-    if not isinstance(elements, list):
-        return None
-    for element in elements:
-        if not isinstance(element, dict):
-            continue
+    for element in _snapshot_elements(snapshot):
         candidate = element.get("screen_id")
         if isinstance(candidate, str) and candidate:
             return candidate
     return None
 
 
-def _build_page_map(snapshot: dict[str, Any]) -> dict[str, Any]:
-    elements = snapshot.get("elements", [])
-    if not isinstance(elements, list) or not elements:
-        return {"tree_hash": snapshot.get("tree_hash"), "page": {"root": None, "signature": {}, "sections": [], "interactive_refs": []}}
+def _choose_page_root(snapshot: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    elements = _snapshot_elements(snapshot)
+    if not elements:
+        return None, {"strategy": "empty", "snapshot_root_ref": None, "ordered_root_ref": None}
 
-    root = elements[0] if isinstance(elements[0], dict) else {}
+    by_ref = {
+        str(element.get("ref")): element
+        for element in elements
+        if isinstance(element.get("ref"), str) and str(element.get("ref")).strip()
+    }
+    snapshot_root_ref = _snapshot_root_ref(snapshot)
+    ordered_root_ref = next(
+        (str(element.get("ref")) for element in elements if isinstance(element.get("ref"), str) and str(element.get("ref")).strip()),
+        None,
+    )
+    if snapshot_root_ref and snapshot_root_ref in by_ref:
+        return by_ref[snapshot_root_ref], {
+            "strategy": "snapshot_root",
+            "snapshot_root_ref": snapshot_root_ref,
+            "ordered_root_ref": ordered_root_ref,
+        }
+
+    screen_id = _snapshot_screen_id(snapshot)
+    if screen_id:
+        candidates = [element for element in elements if str(element.get("screen_id", "")) == screen_id]
+        if candidates:
+            candidates.sort(key=lambda item: (_path_depth(item.get("path")), str(item.get("path", "")), str(item.get("ref", ""))))
+            return candidates[0], {
+                "strategy": "screen_id_fallback",
+                "snapshot_root_ref": snapshot_root_ref,
+                "ordered_root_ref": ordered_root_ref,
+            }
+
+    path_root = next((element for element in elements if str(element.get("path", "")) == "0"), None)
+    if path_root is not None:
+        return path_root, {
+            "strategy": "path_fallback",
+            "snapshot_root_ref": snapshot_root_ref,
+            "ordered_root_ref": ordered_root_ref,
+        }
+
+    return elements[0], {
+        "strategy": "ordered_fallback",
+        "snapshot_root_ref": snapshot_root_ref,
+        "ordered_root_ref": ordered_root_ref,
+    }
+
+
+def _capture_source_is_degraded(capture_source: str) -> bool:
+    normalized = capture_source.strip().lower()
+    if not normalized or normalized == "unknown":
+        return True
+    return normalized.startswith("adb_") or "fallback" in normalized
+
+
+def _snapshot_introspection(snapshot: dict[str, Any]) -> dict[str, Any]:
+    elements = _snapshot_elements(snapshot)
+    visible_elements = sum(1 for element in elements if bool(element.get("visible", True)))
+    interactive_elements = sum(1 for element in elements if bool(element.get("interactive")))
+    semantic_id_count = sum(
+        1
+        for element in elements
+        if isinstance(element.get("semantic_id"), str) and str(element.get("semantic_id")).strip()
+    )
+    screen_ids = sorted(
+        {
+            str(element.get("screen_id"))
+            for element in elements
+            if isinstance(element.get("screen_id"), str) and str(element.get("screen_id")).strip()
+        }
+    )
+    capture_source = snapshot.get("capture_source")
+    if not isinstance(capture_source, str) or not capture_source:
+        capture_source = "unknown"
+    capture_error = snapshot.get("capture_error")
+    if not isinstance(capture_error, dict):
+        capture_error = None
+
+    page_root, root_resolution = _choose_page_root(snapshot)
+    screen_id = _snapshot_screen_id(snapshot)
+    page_root_screen_id = page_root.get("screen_id") if isinstance(page_root, dict) else None
+    snapshot_root_ref = _snapshot_root_ref(snapshot)
+    consistency = {
+        "snapshot_root_present": bool(snapshot_root_ref and root_resolution.get("strategy") == "snapshot_root"),
+        "ordered_root_matches_snapshot_root": not snapshot_root_ref or snapshot_root_ref == root_resolution.get("ordered_root_ref"),
+        "root_screen_matches_snapshot": not screen_id or not page_root_screen_id or screen_id == page_root_screen_id,
+        "single_screen_id": len(screen_ids) <= 1,
+        "root_resolution": root_resolution.get("strategy"),
+    }
+
+    degraded_reasons: list[str] = []
+    if _capture_source_is_degraded(capture_source):
+        degraded_reasons.append("capture_source_degraded")
+    if capture_error is not None:
+        error_code = capture_error.get("error_code")
+        degraded_reasons.append(f"capture_error:{error_code or 'unknown'}")
+    if not screen_id:
+        degraded_reasons.append("missing_screen_id")
+    if semantic_id_count <= 0:
+        degraded_reasons.append("missing_semantic_ids")
+    if snapshot_root_ref and root_resolution.get("strategy") != "snapshot_root":
+        degraded_reasons.append("missing_snapshot_root")
+    if not consistency["root_screen_matches_snapshot"]:
+        degraded_reasons.append("inconsistent_root_screen_id")
+    if not consistency["single_screen_id"]:
+        degraded_reasons.append("multiple_screen_ids")
+
+    return {
+        "screen_id": screen_id,
+        "root_ref": snapshot_root_ref,
+        "capture_source": capture_source,
+        "capture_error": capture_error,
+        "total_elements": len(elements),
+        "visible_elements": visible_elements,
+        "interactive_elements": interactive_elements,
+        "semantic_id_count": semantic_id_count,
+        "screen_ids": screen_ids,
+        "live_semantics_ready": not degraded_reasons,
+        "degraded": bool(degraded_reasons),
+        "degraded_reasons": degraded_reasons,
+        "consistency": consistency,
+    }
+
+
+def _build_page_map(snapshot: dict[str, Any]) -> dict[str, Any]:
+    snapshot_summary = _snapshot_introspection(snapshot)
+    elements = _snapshot_elements(snapshot)
+    root, root_resolution = _choose_page_root(snapshot)
+    if not elements or root is None:
+        return {
+            "tree_hash": snapshot.get("tree_hash"),
+            "snapshot": snapshot_summary,
+            "page": {
+                "screen_id": snapshot_summary.get("screen_id"),
+                "root": None,
+                "signature": {},
+                "sections": [],
+                "interactive_refs": [],
+                "root_resolution": root_resolution,
+            },
+        }
+
     root_path = str(root.get("path", "0"))
     root_prefix = f"{root_path}/"
     sections: list[dict[str, Any]] = []
 
-    for element in elements[1:]:
-        if not isinstance(element, dict):
+    for element in elements:
+        if element is root:
             continue
         path = str(element.get("path", ""))
         if not path.startswith(root_prefix):
@@ -408,12 +569,14 @@ def _build_page_map(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
     return {
         "tree_hash": snapshot.get("tree_hash"),
+        "snapshot": snapshot_summary,
         "page": {
-            "screen_id": _snapshot_screen_id(snapshot),
+            "screen_id": snapshot_summary.get("screen_id"),
             "root": root_summary,
             "signature": signature,
             "sections": sections,
             "interactive_refs": interactive_refs,
+            "root_resolution": root_resolution,
         },
     }
 
@@ -423,23 +586,21 @@ def _build_element_dictionary(
     *,
     fields: list[str] | None = None,
 ) -> dict[str, Any]:
+    snapshot_summary = _snapshot_introspection(snapshot)
     selected_fields = fields or ["screen_id", "semantic_id", "id", "resource_id", "label", "text", "content_desc"]
     allowed_fields = {"screen_id", "semantic_id", "id", "resource_id", "label", "text", "content_desc", "class_name", "type"}
     invalid = [field for field in selected_fields if field not in allowed_fields]
     if invalid:
         raise ValueError(f"unsupported dictionary fields: {', '.join(sorted(set(invalid)))}")
 
-    elements = snapshot.get("elements", [])
-    if not isinstance(elements, list):
-        elements = []
+    elements = _snapshot_elements(snapshot)
 
     dictionary: dict[str, dict[str, Any]] = {field: {} for field in selected_fields}
     ambiguous: list[dict[str, Any]] = []
+    field_stats: dict[str, dict[str, int]] = {}
     for field in selected_fields:
         grouped: dict[str, list[dict[str, Any]]] = {}
         for element in elements:
-            if not isinstance(element, dict):
-                continue
             raw_value = element.get(field)
             if raw_value is None:
                 continue
@@ -475,10 +636,33 @@ def _build_element_dictionary(
                 ],
             }
             dictionary[field][value] = summary
-            if len(grouped_elements) > 1:
+            if field != "screen_id" and len(grouped_elements) > 1:
                 ambiguous.append({"field": field, "value": value, "count": len(grouped_elements), "refs": refs})
+        field_stats[field] = {
+            "value_count": len(grouped),
+            "ambiguous_value_count": sum(
+                1
+                for grouped_elements in grouped.values()
+                if field != "screen_id" and len(grouped_elements) > 1
+            ),
+        }
 
-    return {"tree_hash": snapshot.get("tree_hash"), "dictionary": dictionary, "ambiguous": ambiguous}
+    return {
+        "tree_hash": snapshot.get("tree_hash"),
+        "snapshot": snapshot_summary,
+        "dictionary": dictionary,
+        "ambiguous": ambiguous,
+        "summary": {
+            "fields": selected_fields,
+            "ambiguous_entry_count": len(ambiguous),
+            "field_stats": field_stats,
+            "recommended_lookup_fields": (
+                ["semantic_id", "id", "resource_id", "label"]
+                if bool(snapshot_summary.get("live_semantics_ready"))
+                else ["screen_id", "id", "resource_id", "label", "text", "content_desc"]
+            ),
+        },
+    }
 
 
 def _resolve_snapshot_options(
@@ -523,6 +707,234 @@ def _cached_elements(session: DeviceSession) -> list[dict[str, Any]] | None:
         if isinstance(maybe_elements, list):
             return maybe_elements
     return None
+
+
+def _seed_snapshot_cache(session: DeviceSession, snapshot: dict[str, Any], options: SnapshotOptions = FULL_SNAPSHOT_OPTIONS) -> None:
+    if isinstance(snapshot, dict):
+        session.snapshot_cache[options] = snapshot
+
+
+def _selector_retry_context(selector: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    selector_value = selector.get("value")
+    probe = selector_value.strip() if isinstance(selector_value, str) else ""
+    elements = _snapshot_elements(snapshot)
+    selector_presence = {
+        "semantic_id": False,
+        "id": False,
+        "resource_id": False,
+        "label": False,
+        "text": False,
+        "content_desc": False,
+    }
+    matching_screen_ids: set[str] = set()
+    if probe:
+        for element in elements:
+            for field in selector_presence:
+                value = element.get(field)
+                if isinstance(value, str) and value == probe:
+                    selector_presence[field] = True
+                    screen_id = element.get("screen_id")
+                    if isinstance(screen_id, str) and screen_id.strip():
+                        matching_screen_ids.add(screen_id)
+
+    snapshot_summary = _snapshot_introspection(snapshot)
+    return {
+        "attempted_full_snapshot": True,
+        "selector_value": probe,
+        "selector_presence": selector_presence,
+        "matching_screen_ids": sorted(matching_screen_ids),
+        "semantic_retry_preserved": bool(snapshot_summary.get("live_semantics_ready")),
+        "full_snapshot": {
+            "tree_hash": snapshot.get("tree_hash"),
+            "screen_id": snapshot_summary.get("screen_id"),
+            "screen_ids": snapshot_summary.get("screen_ids"),
+            "capture_source": snapshot_summary.get("capture_source"),
+            "semantic_id_count": snapshot_summary.get("semantic_id_count"),
+            "capture_error": snapshot_summary.get("capture_error"),
+            "live_semantics_ready": snapshot_summary.get("live_semantics_ready"),
+            "degraded": snapshot_summary.get("degraded"),
+            "degraded_reasons": snapshot_summary.get("degraded_reasons"),
+        },
+    }
+
+
+def _poll_driver_settlement(driver: Any) -> dict[str, Any]:
+    settle = getattr(driver, "wait_for_state_settle", None)
+    if callable(settle):
+        return settle(
+            timeout_ms=SETTLEMENT_TIMEOUT_MS,
+            poll_ms=SETTLEMENT_POLL_MS,
+            stable_observations=SETTLEMENT_STABLE_OBSERVATIONS,
+            snapshot_options={"interactive_only": False, "compact": False},
+        )
+
+    started = time.monotonic()
+    attempts = 0
+    observed_stable = 0
+    previous_fingerprint: tuple[Any, ...] | None = None
+    last_snapshot: dict[str, Any] = {}
+    while True:
+        snapshot = driver.snapshot({"interactive_only": False, "compact": False})
+        last_snapshot = snapshot if isinstance(snapshot, dict) else {}
+        attempts += 1
+        elements = last_snapshot.get("elements", [])
+        element_count = len(elements) if isinstance(elements, list) else -1
+        fingerprint = (
+            last_snapshot.get("tree_hash"),
+            last_snapshot.get("screen_id"),
+            last_snapshot.get("root"),
+            element_count,
+        )
+        if previous_fingerprint is not None and fingerprint == previous_fingerprint:
+            observed_stable += 1
+        else:
+            observed_stable = 1
+        previous_fingerprint = fingerprint
+
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if observed_stable >= SETTLEMENT_STABLE_OBSERVATIONS:
+            return {
+                "status": "settled",
+                "attempts": attempts,
+                "elapsed_ms": elapsed_ms,
+                "stable_observations": observed_stable,
+                "tree_hash": last_snapshot.get("tree_hash"),
+                "screen_id": last_snapshot.get("screen_id"),
+                "root": last_snapshot.get("root"),
+                "snapshot": last_snapshot,
+            }
+        if elapsed_ms >= SETTLEMENT_TIMEOUT_MS:
+            return {
+                "status": "timeout",
+                "attempts": attempts,
+                "elapsed_ms": elapsed_ms,
+                "stable_observations": observed_stable,
+                "tree_hash": last_snapshot.get("tree_hash"),
+                "screen_id": last_snapshot.get("screen_id"),
+                "root": last_snapshot.get("root"),
+                "snapshot": last_snapshot,
+            }
+
+        remaining_seconds = max(0.0, (SETTLEMENT_TIMEOUT_MS - elapsed_ms) / 1000.0)
+        sleep_seconds = min(max(SETTLEMENT_POLL_MS, 0) / 1000.0, remaining_seconds)
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+
+def _settle_action(session: DeviceSession, operation: str) -> dict[str, Any]:
+    settle_result = _poll_driver_settlement(session.driver)
+    snapshot = settle_result.get("snapshot")
+    snapshot_summary = _snapshot_introspection(snapshot) if isinstance(snapshot, dict) else {}
+    if isinstance(snapshot, dict):
+        _seed_snapshot_cache(session, snapshot)
+
+    status = "settled"
+    details = "state settled via full operability snapshot"
+    if settle_result.get("status") != "settled":
+        status = "timeout"
+        details = f"{operation} did not reach a stable page state before timeout"
+    elif bool(snapshot_summary.get("degraded")):
+        status = "degraded"
+        details = f"{operation} settled on a degraded snapshot"
+
+    return {
+        "status": status,
+        "details": details,
+        "attempts": settle_result.get("attempts"),
+        "elapsed_ms": settle_result.get("elapsed_ms"),
+        "stable_observations": settle_result.get("stable_observations"),
+        "tree_hash": settle_result.get("tree_hash"),
+        "screen_id": snapshot_summary.get("screen_id"),
+        "snapshot": snapshot_summary,
+        "degraded": bool(snapshot_summary.get("degraded")),
+        "degraded_reasons": list(snapshot_summary.get("degraded_reasons", [])),
+    }
+
+
+def _retry_selector_drift(
+    session: DeviceSession,
+    *,
+    action: dict[str, Any],
+    selector: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    if result.get("status") not in {"error", "fail"} or result.get("error_code") != "selector_drift":
+        return result
+
+    full_snapshot, _ = _cached_snapshot(session, interactive=False, compact=False, refresh=True)
+    if not isinstance(full_snapshot, dict):
+        return result
+
+    retry_context = _selector_retry_context(selector, full_snapshot)
+    retry_summary = retry_context.get("full_snapshot", {})
+    if not bool(retry_summary.get("live_semantics_ready")):
+        return {
+            "status": "error",
+            "error_code": "selector_retry_degraded",
+            "details": "selector drift retry could not stay bridge-first because the full snapshot was degraded",
+            "selector": selector,
+            "retry_context": retry_context,
+            "degraded": True,
+            "degraded_reasons": list(retry_summary.get("degraded_reasons", [])),
+        }
+
+    retried = session.driver.interact(action, elements=_snapshot_elements(full_snapshot))
+    retried = dict(retried)
+    retried["retry_context"] = retry_context
+    return retried
+
+
+def _ambiguity_failure(selector: dict[str, Any], elements: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    if str(selector.get("ambiguity_mode", "")) != "error":
+        return None
+    if not isinstance(elements, list):
+        return None
+
+    by = str(selector.get("by", "")).strip()
+    value = selector.get("value")
+    if not by or not isinstance(value, str) or not value:
+        return None
+
+    field_map = {
+        "id": "id",
+        "semantic_id": "semantic_id",
+        "ref": "ref",
+        "resource_id": "resource_id",
+        "label": "label",
+        "text": "text",
+        "content_desc": "content_desc",
+        "screen_id": "screen_id",
+    }
+    field_name = field_map.get(by)
+    if field_name is None:
+        return None
+
+    matches = [
+        element
+        for element in elements
+        if isinstance(element, dict) and isinstance(element.get(field_name), str) and str(element.get(field_name)) == value
+    ]
+    if len(matches) <= 1:
+        return None
+
+    candidates = [
+        {
+            key: match.get(key)
+            for key in ("ref", "id", "screen_id", "semantic_id", "label", "path", "resource_id", "text", "content_desc", "class_name", "type")
+        }
+        for match in matches
+    ]
+    return {
+        "status": "error",
+        "error_code": "ambiguous_selector",
+        "details": "selector matched multiple elements in ambiguity-safe mode",
+        "selector": selector,
+        "selector_info": {
+            "match_type": "ambiguous",
+            "candidate_count": len(matches),
+        },
+        "candidates": candidates,
+    }
 
 
 def _score_text_match(query: str, value: str, *, exact: bool) -> int:
@@ -686,13 +1098,23 @@ def _tool_device_open(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
         driver=driver,
     )
     DEVICE_SESSION_CACHE[cache_key] = session
+    settlement: dict[str, Any] | None = None
+    if launch.get("status") not in {"error", "fail"} and preflight.get("status") not in {"error", "fail"}:
+        settlement = _settle_action(session, "open")
     if persist_session:
         _save_session_to_file(session_path, session)
 
     status = "ok"
     if launch.get("status") in {"error", "fail"} or preflight.get("status") in {"error", "fail"}:
         status = "error"
-    result_json = {"status": status, "operation": "open", "result": {"launch": launch, "preflight": preflight}}
+    if isinstance(settlement, dict) and settlement.get("status") == "timeout":
+        status = "error"
+    result_json = {
+        "status": status,
+        "operation": "open",
+        "result": {"launch": launch, "preflight": preflight},
+        "settlement": settlement,
+    }
 
     payload = {
         "command": ["device_open"],
@@ -807,7 +1229,7 @@ def _tool_device_page_map(arguments: dict[str, Any], runner: Runner) -> tuple[bo
     session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
     assert session is not None
 
-    snapshot, cache_hit = _cached_snapshot(session, interactive=True, compact=True, refresh=refresh)
+    snapshot, cache_hit = _cached_snapshot(session, interactive=False, compact=False, refresh=refresh)
     result_json = _build_page_map(snapshot)
     if persist_session:
         _save_session_to_file(session_path, session)
@@ -838,7 +1260,7 @@ def _tool_device_element_dictionary(arguments: dict[str, Any], runner: Runner) -
     session, _, session_path, persist_session, _ = _device_session(arguments, require_existing=True)
     assert session is not None
 
-    snapshot, cache_hit = _cached_snapshot(session, interactive=True, compact=True, refresh=refresh)
+    snapshot, cache_hit = _cached_snapshot(session, interactive=False, compact=False, refresh=refresh)
     result_json = _build_element_dictionary(snapshot, fields=fields)
     if persist_session:
         _save_session_to_file(session_path, session)
@@ -869,12 +1291,25 @@ def _tool_device_press(arguments: dict[str, Any], runner: Runner) -> tuple[bool,
     if candidate_limit is not None:
         selector["candidate_limit"] = candidate_limit
     cached_elements = _cached_elements(session)
-    result = session.driver.interact({"action": "tap", "selector": selector}, elements=cached_elements)
+    result = _ambiguity_failure(selector, cached_elements)
+    if result is None:
+        result = session.driver.interact({"action": "tap", "selector": selector}, elements=cached_elements)
+    result = _retry_selector_drift(
+        session,
+        action={"action": "tap", "selector": selector},
+        selector=selector,
+        result=result,
+    )
+    settlement: dict[str, Any] | None = None
     if result.get("status") not in {"error", "fail"}:
         _invalidate_snapshot_cache(session)
+        settlement = _settle_action(session, "press")
     if persist_session:
         _save_session_to_file(session_path, session)
-    result_json = {"status": "ok", "operation": "press", "result": result}
+    status = "error" if result.get("status") in {"error", "fail"} else "ok"
+    if isinstance(settlement, dict) and settlement.get("status") == "timeout":
+        status = "error"
+    result_json = {"status": status, "operation": "press", "result": result, "settlement": settlement}
     command_target = selector.get("value")
 
     payload = {
@@ -887,7 +1322,7 @@ def _tool_device_press(arguments: dict[str, Any], runner: Runner) -> tuple[bool,
         "session_file": str(session_path),
         "persist_session": persist_session,
     }
-    return result.get("status") in {"error", "fail"}, payload
+    return status == "error", payload
 
 
 def _tool_device_fill(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
@@ -903,15 +1338,28 @@ def _tool_device_fill(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
     if candidate_limit is not None:
         selector["candidate_limit"] = candidate_limit
     cached_elements = _cached_elements(session)
-    result = session.driver.interact(
-        {"action": "input_text", "selector": selector, "text": text},
-        elements=cached_elements,
+    result = _ambiguity_failure(selector, cached_elements)
+    if result is None:
+        result = session.driver.interact(
+            {"action": "input_text", "selector": selector, "text": text},
+            elements=cached_elements,
+        )
+    result = _retry_selector_drift(
+        session,
+        action={"action": "input_text", "selector": selector, "text": text},
+        selector=selector,
+        result=result,
     )
+    settlement: dict[str, Any] | None = None
     if result.get("status") not in {"error", "fail"}:
         _invalidate_snapshot_cache(session)
+        settlement = _settle_action(session, "fill")
     if persist_session:
         _save_session_to_file(session_path, session)
-    result_json = {"status": "ok", "operation": "fill", "result": result}
+    status = "error" if result.get("status") in {"error", "fail"} else "ok"
+    if isinstance(settlement, dict) and settlement.get("status") == "timeout":
+        status = "error"
+    result_json = {"status": status, "operation": "fill", "result": result, "settlement": settlement}
     command_target = selector.get("value")
 
     payload = {
@@ -924,7 +1372,7 @@ def _tool_device_fill(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
         "session_file": str(session_path),
         "persist_session": persist_session,
     }
-    return result.get("status") in {"error", "fail"}, payload
+    return status == "error", payload
 
 
 def _tool_device_verify(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
@@ -940,6 +1388,25 @@ def _tool_device_verify(arguments: dict[str, Any], runner: Runner) -> tuple[bool
         selector["ambiguity_mode"] = ambiguity_mode
     if candidate_limit is not None:
         selector["candidate_limit"] = candidate_limit
+    cached_elements = _cached_elements(session)
+    ambiguity_result = _ambiguity_failure(selector, cached_elements)
+    if ambiguity_result is not None:
+        result = ambiguity_result
+        if persist_session:
+            _save_session_to_file(session_path, session)
+        result_json = {"status": "error", "operation": "verify", "result": result}
+        command_target = selector.get("value")
+        payload = {
+            "command": ["device_verify", str(command_target)],
+            "env_overrides": {"DISPATCH_COMMANDS": "1" if session.dispatch_commands else "0"},
+            "exit_code": 0,
+            "stdout": json.dumps(result_json, ensure_ascii=True),
+            "stderr": "",
+            "result_json": result_json,
+            "session_file": str(session_path),
+            "persist_session": persist_session,
+        }
+        return True, payload
     assertion = {"action": "assert_visible", "selector": selector, "timeout_ms": timeout_ms or 5000, "value": expected}
     result = session.driver.verify(assertion)
     if persist_session:
@@ -1261,6 +1728,36 @@ def _payload_text(name: str, payload: dict[str, Any], is_error: bool) -> str:
     query = payload.get("query")
     if isinstance(query, str) and query:
         parts.append(f"query={query}")
+
+    result_json = payload.get("result_json")
+    if isinstance(result_json, dict):
+        snapshot_summary = result_json.get("snapshot")
+        if isinstance(snapshot_summary, dict):
+            screen_id = snapshot_summary.get("screen_id")
+            if isinstance(screen_id, str) and screen_id:
+                parts.append(f"screen_id={screen_id}")
+            capture_source = snapshot_summary.get("capture_source")
+            if isinstance(capture_source, str) and capture_source:
+                parts.append(f"capture_source={capture_source}")
+            semantic_id_count = snapshot_summary.get("semantic_id_count")
+            if isinstance(semantic_id_count, int):
+                parts.append(f"semantic_ids={semantic_id_count}")
+            if bool(snapshot_summary.get("degraded")):
+                parts.append("degraded=true")
+
+        summary = result_json.get("summary")
+        if isinstance(summary, dict):
+            ambiguous_entry_count = summary.get("ambiguous_entry_count")
+            if isinstance(ambiguous_entry_count, int):
+                parts.append(f"ambiguous_entries={ambiguous_entry_count}")
+
+        settlement = result_json.get("settlement")
+        if isinstance(settlement, dict):
+            settlement_status = settlement.get("status")
+            if isinstance(settlement_status, str) and settlement_status:
+                parts.append(f"settlement={settlement_status}")
+            if bool(settlement.get("degraded")):
+                parts.append("degraded=true")
 
     return "; ".join(parts)
 
