@@ -688,6 +688,12 @@ def _cached_snapshot(
         cached = session.snapshot_cache.get(options)
         if isinstance(cached, dict):
             return cached, True
+        if options == LIGHTWEIGHT_SNAPSHOT_OPTIONS:
+            full_cached = session.snapshot_cache.get(FULL_SNAPSHOT_OPTIONS)
+            if isinstance(full_cached, dict):
+                full_summary = _snapshot_introspection(full_cached)
+                if bool(full_summary.get("live_semantics_ready")):
+                    return full_cached, True
     snapshot = session.driver.snapshot({"interactive_only": options[0], "compact": options[1]})
     if isinstance(snapshot, dict):
         session.snapshot_cache[options] = snapshot
@@ -779,13 +785,17 @@ def _selector_retry_context(selector: dict[str, Any], snapshot: dict[str, Any]) 
 
 
 def _poll_driver_settlement(driver: Any, *, prefer_live_semantics: bool = False) -> dict[str, Any]:
+    snapshot_options = {"interactive_only": False, "compact": False}
+    if prefer_live_semantics:
+        snapshot_options["bridge_first_full"] = True
+
     settle = getattr(driver, "wait_for_state_settle", None)
     if callable(settle) and not prefer_live_semantics:
         return settle(
             timeout_ms=SETTLEMENT_TIMEOUT_MS,
             poll_ms=SETTLEMENT_POLL_MS,
             stable_observations=SETTLEMENT_STABLE_OBSERVATIONS,
-            snapshot_options={"interactive_only": False, "compact": False},
+            snapshot_options=snapshot_options,
         )
 
     started = time.monotonic()
@@ -796,7 +806,7 @@ def _poll_driver_settlement(driver: Any, *, prefer_live_semantics: bool = False)
     stable_semantic_snapshot: dict[str, Any] | None = None
     stable_semantic_observations = 0
     while True:
-        snapshot = driver.snapshot({"interactive_only": False, "compact": False})
+        snapshot = driver.snapshot(dict(snapshot_options))
         last_snapshot = snapshot if isinstance(snapshot, dict) else {}
         attempts += 1
         elements = last_snapshot.get("elements", [])
@@ -896,7 +906,7 @@ def _retry_selector_drift(
     if result.get("status") not in {"error", "fail"} or result.get("error_code") != "selector_drift":
         return result
 
-    full_snapshot, _ = _cached_snapshot(session, interactive=False, compact=False, refresh=True)
+    full_snapshot = session.driver.snapshot({"interactive_only": False, "compact": False, "bridge_first_full": True})
     if not isinstance(full_snapshot, dict):
         return result
 
