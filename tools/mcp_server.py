@@ -1131,6 +1131,13 @@ def _preflight_prefers_semantic_settlement(preflight: dict[str, Any]) -> bool:
     return bridge_status in {"healthy", "ok", "ready", "connected"}
 
 
+def _post_action_prefers_semantic_settlement(session: DeviceSession) -> bool:
+    preflight = session.driver.preflight()
+    if not isinstance(preflight, dict):
+        return False
+    return _preflight_prefers_semantic_settlement(preflight)
+
+
 def _tool_device_open(arguments: dict[str, Any], runner: Runner) -> tuple[bool, dict[str, Any]]:
     _ = runner
     platform = _expect_str(arguments, "platform")
@@ -1364,8 +1371,9 @@ def _tool_device_press(arguments: dict[str, Any], runner: Runner) -> tuple[bool,
     )
     settlement: dict[str, Any] | None = None
     if result.get("status") not in {"error", "fail"}:
+        prefer_live_semantics = _post_action_prefers_semantic_settlement(session)
         _invalidate_snapshot_cache(session)
-        settlement = _settle_action(session, "press")
+        settlement = _settle_action(session, "press", prefer_live_semantics=prefer_live_semantics)
     if persist_session:
         _save_session_to_file(session_path, session)
     status = "error" if result.get("status") in {"error", "fail"} else "ok"
@@ -1414,8 +1422,9 @@ def _tool_device_fill(arguments: dict[str, Any], runner: Runner) -> tuple[bool, 
     )
     settlement: dict[str, Any] | None = None
     if result.get("status") not in {"error", "fail"}:
+        prefer_live_semantics = _post_action_prefers_semantic_settlement(session)
         _invalidate_snapshot_cache(session)
-        settlement = _settle_action(session, "fill")
+        settlement = _settle_action(session, "fill", prefer_live_semantics=prefer_live_semantics)
     if persist_session:
         _save_session_to_file(session_path, session)
     status = "error" if result.get("status") in {"error", "fail"} else "ok"
