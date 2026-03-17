@@ -116,18 +116,25 @@ class AndroidDriver(DeviceHarness):
         report["interactive_only_requested"] = request["interactive_only"]
         report["compact_requested"] = request["compact"]
 
+        interactive_elements = [
+            element
+            for element in snapshot.get("elements", [])
+            if isinstance(element, dict) and element.get("interactive")
+        ]
+        snapshot["interactive_projection"] = {
+            "mode": "derived_projection",
+            "requested": request["interactive_only"],
+            "authoritative_root": snapshot.get("root"),
+            "root": interactive_elements[0]["ref"] if interactive_elements else None,
+            "element_count": len(interactive_elements),
+            "element_ids": [str(element["id"]) for element in interactive_elements if element.get("id")],
+            "element_refs": [str(element["ref"]) for element in interactive_elements if element.get("ref")],
+        }
         if request["interactive_only"]:
-            elements = [
-                element
-                for element in snapshot.get("elements", [])
-                if isinstance(element, dict) and element.get("interactive")
-            ]
-            snapshot["elements"] = elements
-            snapshot["root"] = elements[0]["ref"] if elements else "root"
-            snapshot["tree_hash"] = self._tree_hash(elements)
-            snapshot["element_map"] = {el["id"]: el["ref"] for el in elements if el.get("id")}
             report["interactive_only_applied"] = True
-            report["filtered_node_count"] = len(elements)
+            report["interactive_only_mode"] = "projection"
+            report["filtered_node_count"] = len(interactive_elements)
+            report["authoritative_root_preserved"] = True
 
         snapshot["normalization_report"] = report
         return snapshot
@@ -147,6 +154,30 @@ class AndroidDriver(DeviceHarness):
             "bridge_http_status": capture.get("bridge_http_status"),
         }
 
+    @staticmethod
+    def _snapshot_health(
+        snapshot: dict[str, Any],
+        *,
+        degraded: bool,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        capture_error = snapshot.get("capture_error")
+        if reason is None and isinstance(capture_error, dict):
+            reason = str(
+                capture_error.get("error_code")
+                or capture_error.get("bridge_error_code")
+                or capture_error.get("adb_error_code")
+                or ""
+            )
+        health = {
+            "status": "degraded" if degraded else "healthy",
+            "degraded": degraded,
+            "capture_source": snapshot.get("capture_source"),
+        }
+        if reason:
+            health["reason"] = reason
+        return health
+
     def _normalize_adb_fallback(
         self,
         adb_capture: dict[str, Any],
@@ -163,6 +194,7 @@ class AndroidDriver(DeviceHarness):
             trace = {}
         trace["bridge_snapshot"] = bridge_capture.get("capture_trace")
         snapshot["capture_trace"] = trace
+        snapshot["snapshot_health"] = self._snapshot_health(snapshot, degraded=True)
         return snapshot
 
     def _synthetic_snapshot_fallback(
@@ -192,6 +224,7 @@ class AndroidDriver(DeviceHarness):
             trace["adb_snapshot"] = adb_capture
         fallback["capture_trace"] = trace
         fallback["raw_tree"] = bridge_capture.get("payload")
+        fallback["snapshot_health"] = self._snapshot_health(fallback, degraded=True)
         return fallback
 
     def _adb_snapshot(self) -> dict[str, Any]:
@@ -248,6 +281,7 @@ class AndroidDriver(DeviceHarness):
                 "capture_source": "adb_parse_error",
                 "capture_error": {"error_code": "xml_parse_error", "details": str(e)},
             }
+            snapshot["snapshot_health"] = self._snapshot_health(snapshot, degraded=True, reason="xml_parse_error")
             return self._apply_snapshot_request(snapshot, options)
 
         elements = []
@@ -331,6 +365,7 @@ class AndroidDriver(DeviceHarness):
             "source_request_id": capture.get("request_id"),
             "capture_trace": {"adb_dump": "success"},
         }
+        snapshot["snapshot_health"] = self._snapshot_health(snapshot, degraded=False)
         return self._apply_snapshot_request(snapshot, options)
 
     def command_for_action(self, action: dict[str, Any]) -> str | None:
@@ -518,6 +553,7 @@ class AndroidDriver(DeviceHarness):
         if root_id not in nodes_by_id:
             candidates = [node_id for node_id, node in nodes_by_id.items() if not node.get("parent_id")]
             root_id = sorted(candidates)[0] if candidates else sorted(nodes_by_id.keys())[0]
+        active_screen_id = str(raw_payload.get("screen_id") or nodes_by_id[root_id].get("screen_id") or "")
 
         ordered_elements: list[dict[str, Any]] = []
         visited: set[str] = set()
@@ -527,6 +563,13 @@ class AndroidDriver(DeviceHarness):
                 return
             node = nodes_by_id.get(node_id)
             if not node:
+                return
+            if (
+                node_id != root_id
+                and active_screen_id
+                and node.get("screen_id")
+                and node["screen_id"] != active_screen_id
+            ):
                 return
             visited.add(node_id)
 
@@ -576,9 +619,13 @@ class AndroidDriver(DeviceHarness):
                 walk(child_id, f"{path}/{idx}", depth + 1)
 
         walk(root_id, "0", 0)
-        for node_id in sorted(nodes_by_id):
-            if node_id not in visited:
-                walk(node_id, f"9/{len(ordered_elements)}", 1)
+        if not ordered_elements:
+            return self._synthetic_snapshot_fallback(
+                options,
+                bridge_capture=capture,
+                error_code="bridge_empty_active_scope",
+                details="bridge returned no nodes for the active scope",
+            )
 
         tree_hash = self._tree_hash(ordered_elements)
         diagnostics = raw_payload.get("diagnostics", {})
@@ -587,13 +634,16 @@ class AndroidDriver(DeviceHarness):
             diagnostics_warnings = diagnostics.get("warnings", [])
             if isinstance(diagnostics_warnings, list):
                 warnings = [str(item) for item in diagnostics_warnings]
+        dropped_out_of_scope_nodes = max(len(nodes_by_id) - len(visited), 0)
+        if dropped_out_of_scope_nodes:
+            warnings.append(f"dropped_out_of_scope_nodes:{dropped_out_of_scope_nodes}")
 
         snapshot = {
             "schema_version": "cat.v2",
             "platform": self.platform,
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "root": ordered_elements[0]["ref"],
-            "screen_id": str(raw_payload.get("screen_id") or nodes_by_id[root_id].get("screen_id") or ""),
+            "screen_id": active_screen_id,
             "elements": ordered_elements,
             "tree_hash": tree_hash,
             "element_map": {el["id"]: el["ref"] for el in ordered_elements if el.get("id")},
@@ -605,9 +655,13 @@ class AndroidDriver(DeviceHarness):
                 "raw_node_count": len(raw_nodes),
                 "normalized_node_count": len(ordered_elements),
                 "dropped_nodes": dropped_nodes,
+                "active_root_id": root_id,
+                "active_scope_screen_id": active_screen_id or None,
+                "dropped_out_of_scope_nodes": dropped_out_of_scope_nodes,
                 "warnings": warnings,
             },
             "raw_tree": raw_payload,
             "capture_trace": capture.get("capture_trace"),
         }
+        snapshot["snapshot_health"] = self._snapshot_health(snapshot, degraded=False)
         return self._apply_snapshot_request(snapshot, options)
