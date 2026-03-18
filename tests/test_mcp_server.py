@@ -53,7 +53,7 @@ class _RecordingDriver:
             "compact": bool((options or {}).get("compact", False)),
         }
         self.snapshot_calls.append(resolved)
-        suffix = f"{int(resolved['interactive_only'])}:{int(resolved['compact'])}"
+        suffix = f"{int(resolved['interactive_only'])}:{int(resolved['compact'])}:{len(self.snapshot_calls)}"
         elements = [
             {
                 "id": "screen.home_screen",
@@ -82,7 +82,7 @@ class _RecordingDriver:
                 "content_desc": "search box",
                 "class_name": "android.widget.EditText",
                 "type": "input",
-                "interactive": True,
+                "interactive": resolved["interactive_only"],
                 "enabled": True,
                 "visible": True,
                 "bounds": [0, 0, 100, 40],
@@ -92,12 +92,10 @@ class _RecordingDriver:
         return {
             "schema_version": "cat.v2",
             "tree_hash": suffix,
-            "root": "@screen-home",
             "screen_id": "home_screen",
             "elements": elements,
             "options": resolved,
             "element_map": {element["id"]: element["ref"] for element in elements},
-            "capture_source": "synthetic_state_model",
             "capture_trace": {"details": "x" * 256},
         }
 
@@ -114,12 +112,11 @@ class _RecordingDriver:
 class _SemanticRecordingDriver(_RecordingDriver):
     def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = super().snapshot(options)
-        payload["capture_source"] = "android_accessibility_bridge"
         payload["screen_id"] = "home_screen"
+        payload["capture_source"] = "android_accessibility_bridge"
         payload["elements"][0]["screen_id"] = "home_screen"
         payload["elements"][1]["screen_id"] = "home_screen"
         payload["elements"][1]["semantic_id"] = "search.query_input"
-        payload["elements"] = [payload["elements"][1], payload["elements"][0]]
         return payload
 
 
@@ -130,183 +127,44 @@ class _FallbackRecordingDriver(_RecordingDriver):
         payload["capture_error"] = {"error_code": "bridge_http_error", "details": "bridge returned 502"}
         payload["screen_id"] = None
         payload["elements"][0]["screen_id"] = None
+        payload["elements"][0]["resource_id"] = "root"
         payload["elements"][1]["screen_id"] = None
         payload["elements"][1].pop("semantic_id", None)
         return payload
 
 
-class _SelectorDriftRetryDriver(_SemanticRecordingDriver):
-    def interact(self, action: dict[str, Any], elements: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        selector = action.get("selector") or {}
-        selector_value = str(selector.get("value", ""))
-        if action.get("action") == "launch_app":
-            return {"status": "ok"}
-        if elements and any(str(item.get("id", "")) == selector_value for item in elements if isinstance(item, dict)):
-            return {"status": "ok", "action": action.get("action"), "selector": selector_value}
-        return {
-            "status": "error",
-            "error_code": "selector_drift",
-            "details": "selector not found in cached elements",
-        }
-
+class _WarmLaunchDriver(_RecordingDriver):
     def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = super().snapshot(options)
-        if not bool((options or {}).get("interactive_only", False)):
-            payload["elements"].append(
-                {
-                    "id": "search.query_input",
-                    "screen_id": "home_screen",
-                    "semantic_id": "search.query_input",
-                    "label": "Search keywords",
-                    "ref": "@e-search-real",
-                    "resource_id": "search.query_input",
-                    "text": "Search keywords",
-                    "content_desc": "Search keywords",
-                    "class_name": "android.widget.EditText",
-                    "type": "input",
-                    "interactive": True,
-                    "enabled": True,
-                    "visible": True,
-                    "bounds": [0, 0, 100, 40],
-                    "path": "0/9",
-                }
-            )
-        return payload
+        resolved = payload["options"]
+        bridge_first_full = bool((options or {}).get("bridge_first_full", False))
 
+        if bridge_first_full and not resolved["interactive_only"] and not resolved["compact"]:
+            payload["tree_hash"] = "warm-open-full"
+            payload["capture_source"] = "android_accessibility_bridge"
+            payload["screen_id"] = "home_screen"
+            payload["elements"][0]["screen_id"] = "home_screen"
+            payload["elements"][1]["screen_id"] = "home_screen"
+            payload["elements"][1]["semantic_id"] = "search.query_input"
+            return payload
 
-class _SelectorDriftFallbackDriver(_SelectorDriftRetryDriver):
-    def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = super().snapshot(options)
-        if not bool((options or {}).get("interactive_only", False)):
-            payload["capture_source"] = "adb_uiautomator_fallback"
-            payload["capture_error"] = {"error_code": "bridge_http_error", "details": "bridge returned 502"}
-            payload["screen_id"] = None
-            for element in payload["elements"]:
-                if isinstance(element, dict):
-                    element["screen_id"] = None
-                    element.pop("semantic_id", None)
-        return payload
+        if resolved["interactive_only"] and resolved["compact"]:
+            payload["tree_hash"] = "warm-open-light"
+            payload["capture_source"] = "android_accessibility_bridge"
+            payload["screen_id"] = "home_screen"
+            payload["elements"][0]["screen_id"] = "home_screen"
+            payload["elements"][1]["screen_id"] = "home_screen"
+            payload["elements"][1]["semantic_id"] = "search.query_input"
+            return payload
 
-
-class _NeverSettlesDriver(_SemanticRecordingDriver):
-    def __init__(self, app: dict[str, Any], dispatch_commands: bool) -> None:
-        super().__init__(app=app, dispatch_commands=dispatch_commands)
-        self._unstable = False
-        self._unstable_counter = 0
-
-    def interact(self, action: dict[str, Any], elements: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-        _ = elements
-        self._unstable = action.get("action") in {"launch_app", "tap", "input_text"}
-        return {"status": "ok", "action": action.get("action")}
-
-    def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = super().snapshot(options)
-        if self._unstable:
-            self._unstable_counter += 1
-            payload["tree_hash"] = f"unstable-{self._unstable_counter}"
-        return payload
-
-
-class _WarmLaunchSemanticRecoveryDriver(_SemanticRecordingDriver):
-    def __init__(self, app: dict[str, Any], dispatch_commands: bool) -> None:
-        super().__init__(app=app, dispatch_commands=dispatch_commands)
-        self._full_snapshot_attempts = 0
-
-    def preflight(self) -> dict[str, Any]:
-        return {"status": "ok", "bridge": {"status": "healthy"}}
-
-    def _fallback_snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
-        payload = _RecordingDriver.snapshot(self, options)
+        payload["tree_hash"] = "warm-open-adb"
         payload["capture_source"] = "adb_uiautomator_fallback"
-        payload["capture_error"] = {"error_code": "bridge_http_error", "details": "bridge returned 502"}
+        payload["capture_error"] = {"error_code": "bridge_not_requested", "details": "full snapshot defaulted to adb"}
         payload["screen_id"] = None
         payload["elements"][0]["screen_id"] = None
         payload["elements"][1]["screen_id"] = None
         payload["elements"][1].pop("semantic_id", None)
         return payload
-
-    def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
-        resolved = {
-            "interactive_only": bool((options or {}).get("interactive_only", False)),
-            "compact": bool((options or {}).get("compact", False)),
-        }
-        if resolved["interactive_only"] or resolved["compact"]:
-            return self._fallback_snapshot(options)
-
-        self._full_snapshot_attempts += 1
-        if self._full_snapshot_attempts < 2:
-            payload = self._fallback_snapshot(options)
-            payload["tree_hash"] = f"warm-fallback-{self._full_snapshot_attempts}"
-            return payload
-
-        payload = _SemanticRecordingDriver.snapshot(self, options)
-        payload["tree_hash"] = "screen.settings"
-        payload["root"] = "@screen-settings"
-        payload["screen_id"] = "screen.settings"
-        for element in payload["elements"]:
-            if isinstance(element, dict):
-                element["screen_id"] = "screen.settings"
-
-        screen = next((element for element in payload["elements"] if isinstance(element, dict) and element.get("type") == "screen"), None)
-        if isinstance(screen, dict):
-            screen["id"] = "screen.settings"
-            screen["ref"] = "@screen-settings"
-            screen["resource_id"] = "screen.settings"
-            screen["label"] = "Settings"
-            screen["text"] = "Settings"
-            screen["content_desc"] = "settings"
-        return payload
-
-    def wait_for_state_settle(
-        self,
-        *,
-        timeout_ms: int,
-        poll_ms: int,
-        stable_observations: int,
-        snapshot_options: dict[str, Any],
-    ) -> dict[str, Any]:
-        _ = poll_ms
-        degraded = self._fallback_snapshot(snapshot_options)
-        degraded["tree_hash"] = "warm-launch-degraded"
-        return {
-            "status": "timeout",
-            "attempts": 1,
-            "elapsed_ms": timeout_ms,
-            "stable_observations": stable_observations,
-            "tree_hash": degraded.get("tree_hash"),
-            "screen_id": degraded.get("screen_id"),
-            "root": degraded.get("root"),
-            "snapshot": degraded,
-        }
-
-
-class _PostActionSemanticSettlementDriver(_WarmLaunchSemanticRecoveryDriver):
-    def __init__(self, app: dict[str, Any], dispatch_commands: bool) -> None:
-        super().__init__(app=app, dispatch_commands=dispatch_commands)
-        self.wait_for_state_settle_calls = 0
-
-    def wait_for_state_settle(
-        self,
-        *,
-        timeout_ms: int,
-        poll_ms: int,
-        stable_observations: int,
-        snapshot_options: dict[str, Any],
-    ) -> dict[str, Any]:
-        _ = (poll_ms, stable_observations)
-        self.wait_for_state_settle_calls += 1
-        degraded = self._fallback_snapshot(snapshot_options)
-        degraded["tree_hash"] = "post-action-degraded"
-        return {
-            "status": "settled",
-            "attempts": 1,
-            "elapsed_ms": timeout_ms,
-            "stable_observations": 1,
-            "tree_hash": degraded.get("tree_hash"),
-            "screen_id": degraded.get("screen_id"),
-            "root": degraded.get("root"),
-            "snapshot": degraded,
-        }
 
 
 class _AmbiguousSelectorDriver(DeviceHarness):
@@ -409,74 +267,50 @@ class _AmbiguousSelectorDriver(DeviceHarness):
         }
 
 
+class _SelectorDriftRetryDriver(_RecordingDriver):
+    def interact(self, action: dict[str, Any], elements: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        selector = action.get("selector") or {}
+        selector_value = str(selector.get("value", ""))
+        if action.get("action") == "launch_app":
+            return {"status": "ok"}
+        if elements and any(str(item.get("id", "")) == selector_value for item in elements if isinstance(item, dict)):
+            return {"status": "ok", "action": action.get("action"), "selector": selector_value}
+        return {
+            "status": "error",
+            "error_code": "selector_drift",
+            "details": "selector not found in cached elements",
+        }
+
+    def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = super().snapshot(options)
+        resolved = payload["options"]
+        if not resolved["interactive_only"] and not resolved["compact"]:
+            payload["capture_source"] = "android_accessibility_bridge"
+            payload["elements"].append(
+                {
+                    "id": "search.query_input",
+                    "screen_id": "search",
+                    "semantic_id": "search.query_input",
+                    "label": "Search keywords",
+                    "ref": "@e-search-real",
+                    "resource_id": "search.query_input",
+                    "text": "Search keywords",
+                    "content_desc": "Search keywords",
+                    "class_name": "android.widget.EditText",
+                    "type": "input",
+                    "interactive": True,
+                    "enabled": True,
+                    "visible": True,
+                    "bounds": [0, 0, 100, 40],
+                    "path": "0/9",
+                }
+            )
+        return payload
+
+
 class TestMCPServer(unittest.TestCase):
     def setUp(self) -> None:
         mcp_server.DEVICE_SESSION_CACHE.clear()
-
-    def _assert_post_action_settlement_stays_semantic(
-        self,
-        *,
-        tool_name: str,
-        arguments: dict[str, Any],
-    ) -> None:
-        with tempfile.TemporaryDirectory(prefix=f"mcp-{tool_name}-semantic-settle-") as tmp:
-            session_file = str(Path(tmp) / "session.json")
-            server = mcp_server.MCPServer(runner=_FailRunner())
-            driver = _PostActionSemanticSettlementDriver(
-                app={"android_package": "com.example.app"},
-                dispatch_commands=False,
-            )
-
-            with mock.patch("tools.mcp_server._build_device_driver", return_value=driver):
-                open_response = server.handle_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 127,
-                        "method": "tools/call",
-                        "params": {
-                            "name": "device_open",
-                            "arguments": {
-                                "platform": "android",
-                                "app": "com.example.app",
-                                "dispatch_commands": False,
-                                "session_file": session_file,
-                            },
-                        },
-                    }
-                )
-                self.assertIsNotNone(open_response)
-                self.assertFalse(open_response["result"]["isError"])  # type: ignore[index]
-
-                driver.raw_snapshot_calls.clear()
-
-                action_response = server.handle_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 128,
-                        "method": "tools/call",
-                        "params": {
-                            "name": tool_name,
-                            "arguments": {"session_file": session_file, **arguments},
-                        },
-                    }
-                )
-
-            self.assertIsNotNone(action_response)
-            self.assertFalse(action_response["result"]["isError"])  # type: ignore[index]
-            result_json = action_response["result"]["structuredContent"]["result_json"]  # type: ignore[index]
-            self.assertEqual(result_json["status"], "ok")
-            self.assertEqual(result_json["settlement"]["status"], "settled")
-            self.assertEqual(result_json["settlement"]["screen_id"], "screen.settings")
-            self.assertTrue(result_json["settlement"]["snapshot"]["live_semantics_ready"])
-            self.assertFalse(result_json["settlement"]["degraded"])
-            self.assertEqual(driver.wait_for_state_settle_calls, 0)
-            self.assertEqual(
-                driver.raw_snapshot_calls,
-                [
-                    {"interactive_only": False, "compact": False, "bridge_first_full": True},
-                    {"interactive_only": False, "compact": False, "bridge_first_full": True},
-                ],
-            )
 
     def test_tools_list_contains_core_tools(self) -> None:
         server = mcp_server.MCPServer()
@@ -709,8 +543,6 @@ class TestMCPServer(unittest.TestCase):
                     }
                 )
                 self.assertIsNotNone(open_response)
-                mcp_server.DEVICE_SESSION_CACHE[session_file].snapshot_cache.clear()
-                driver.snapshot_calls.clear()
 
                 snapshot_response = server.handle_message(
                     {
@@ -751,8 +583,6 @@ class TestMCPServer(unittest.TestCase):
                     }
                 )
                 self.assertIsNotNone(open_response)
-                mcp_server.DEVICE_SESSION_CACHE[session_file].snapshot_cache.clear()
-                driver.snapshot_calls.clear()
 
                 default_snapshot_1 = server.handle_message(
                     {
@@ -809,17 +639,74 @@ class TestMCPServer(unittest.TestCase):
                 full_snapshot_1["result"]["structuredContent"]["result_json"]["tree_hash"],  # type: ignore[index]
             )
 
+    def test_device_open_settles_bridge_first_and_primes_first_page_map(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mcp-device-open-settle-") as tmp:
+            session_file = str(Path(tmp) / "session.json")
+            driver = _WarmLaunchDriver(app={"android_package": "com.example.app"}, dispatch_commands=True)
+            server = mcp_server.MCPServer(runner=_FailRunner())
+
+            with mock.patch("tools.mcp_server._build_device_driver", return_value=driver):
+                open_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 72,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "device_open",
+                            "arguments": {
+                                "platform": "android",
+                                "app": "com.example.app",
+                                "dispatch_commands": True,
+                                "session_file": session_file,
+                            },
+                        },
+                    }
+                )
+                self.assertIsNotNone(open_response)
+
+                page_map_response = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 73,
+                        "method": "tools/call",
+                        "params": {"name": "device_page_map", "arguments": {"session_file": session_file}},
+                    }
+                )
+
+            self.assertIsNotNone(page_map_response)
+            self.assertFalse(open_response["result"]["isError"])  # type: ignore[index]
+            open_result = open_response["result"]["structuredContent"]["result_json"]["result"]  # type: ignore[index]
+            settlement = open_result["settlement"]
+            self.assertEqual(settlement["status"], "ready")
+            self.assertEqual(settlement["snapshot"]["capture_source"], "android_accessibility_bridge")
+            self.assertEqual(settlement["snapshot"]["screen_id"], "home_screen")
+            self.assertEqual(settlement["snapshot"]["semantic_id_count"], 1)
+            self.assertEqual(
+                driver.raw_snapshot_calls,
+                [
+                    {"interactive_only": False, "compact": False, "bridge_first_full": True},
+                    {"interactive_only": False, "compact": False, "bridge_first_full": True},
+                    {"interactive_only": True, "compact": True},
+                ],
+            )
+
+            structured = page_map_response["result"]["structuredContent"]  # type: ignore[index]
+            page_map = structured["result_json"]
+            self.assertTrue(structured["cache_hit"])
+            self.assertEqual(page_map["page"]["screen_id"], "home_screen")
+            self.assertEqual(page_map["snapshot"]["capture_source"], "android_accessibility_bridge")
+            self.assertEqual(page_map["snapshot"]["semantic_id_count"], 1)
+
     def test_device_page_map_and_dictionary_are_available(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mcp-device-map-") as tmp:
             session_file = str(Path(tmp) / "session.json")
             server = mcp_server.MCPServer(runner=_FailRunner())
-            driver = _SemanticRecordingDriver(
-                app={"android_package": "com.example.app"},
-                dispatch_commands=False,
-            )
             with mock.patch(
                 "tools.mcp_server._build_device_driver",
-                return_value=driver,
+                return_value=_SemanticRecordingDriver(
+                    app={"android_package": "com.example.app"},
+                    dispatch_commands=False,
+                ),
             ):
                 open_response = server.handle_message(
                     {
@@ -838,10 +725,6 @@ class TestMCPServer(unittest.TestCase):
                     }
                 )
                 self.assertIsNotNone(open_response)
-                open_result = open_response["result"]["structuredContent"]["result_json"]  # type: ignore[index]
-                self.assertEqual(open_result["settlement"]["status"], "settled")
-                mcp_server.DEVICE_SESSION_CACHE[session_file].snapshot_cache.clear()
-                driver.snapshot_calls.clear()
 
                 page_map_response = server.handle_message(
                     {
@@ -857,11 +740,12 @@ class TestMCPServer(unittest.TestCase):
                 self.assertEqual(page_map["page"]["screen_id"], "home_screen")
                 self.assertEqual(page_map["page"]["root"]["id"], "screen.home_screen")
                 self.assertEqual(page_map["page"]["root"]["screen_id"], "home_screen")
-                self.assertEqual(page_map["page"]["root_resolution"]["strategy"], "snapshot_root")
                 self.assertTrue(page_map["page"]["interactive_refs"])
-                self.assertTrue(page_map["snapshot"]["live_semantics_ready"])
-                self.assertFalse(page_map["snapshot"]["degraded"])
-                self.assertFalse(page_map["snapshot"]["consistency"]["ordered_root_matches_snapshot_root"])
+                self.assertEqual(page_map["snapshot"]["capture_source"], "android_accessibility_bridge")
+                self.assertEqual(page_map["snapshot"]["semantic_id_count"], 1)
+                self.assertNotIn("live_semantics_ready", page_map["snapshot"])
+                self.assertNotIn("degraded", page_map["snapshot"])
+                self.assertNotIn("degraded_reasons", page_map["snapshot"])
                 self.assertTrue(any(str(section["id"]).startswith("search_box_") for section in page_map["page"]["sections"]))
                 self.assertIn("screen_id=home_screen", page_map_text)
                 self.assertIn("capture_source=android_accessibility_bridge", page_map_text)
@@ -883,19 +767,20 @@ class TestMCPServer(unittest.TestCase):
                 self.assertIn("home_screen", dictionary["dictionary"]["screen_id"])
                 self.assertEqual(dictionary["summary"]["ambiguous_entry_count"], 0)
                 self.assertEqual(dictionary["summary"]["field_stats"]["semantic_id"]["value_count"], 1)
-                self.assertEqual(dictionary["summary"]["recommended_lookup_fields"], ["semantic_id", "id", "resource_id", "label"])
+                self.assertNotIn("recommended_lookup_fields", dictionary["summary"])
                 self.assertIn("ambiguous_entries=0", dictionary_text)
-                self.assertEqual(driver.snapshot_calls, [{"interactive_only": False, "compact": False}])
 
-    def test_device_page_map_reports_degraded_snapshot_state(self) -> None:
+    def test_device_page_map_reports_generic_snapshot_metadata_when_bridge_semantics_are_missing(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mcp-device-map-fallback-") as tmp:
             session_file = str(Path(tmp) / "session.json")
             server = mcp_server.MCPServer(runner=_FailRunner())
-            driver = _FallbackRecordingDriver(
-                app={"android_package": "com.example.app"},
-                dispatch_commands=False,
-            )
-            with mock.patch("tools.mcp_server._build_device_driver", return_value=driver):
+            with mock.patch(
+                "tools.mcp_server._build_device_driver",
+                return_value=_FallbackRecordingDriver(
+                    app={"android_package": "com.example.app"},
+                    dispatch_commands=False,
+                ),
+            ):
                 open_response = server.handle_message(
                     {
                         "jsonrpc": "2.0",
@@ -913,8 +798,6 @@ class TestMCPServer(unittest.TestCase):
                     }
                 )
                 self.assertIsNotNone(open_response)
-                mcp_server.DEVICE_SESSION_CACHE[session_file].snapshot_cache.clear()
-                driver.snapshot_calls.clear()
 
                 page_map_response = server.handle_message(
                     {
@@ -935,23 +818,73 @@ class TestMCPServer(unittest.TestCase):
 
             self.assertIsNotNone(page_map_response)
             page_map = page_map_response["result"]["structuredContent"]["result_json"]  # type: ignore[index]
-            page_map_text = page_map_response["result"]["content"][0]["text"]  # type: ignore[index]
             self.assertEqual(page_map["snapshot"]["capture_source"], "adb_uiautomator_fallback")
             self.assertEqual(page_map["snapshot"]["semantic_id_count"], 0)
-            self.assertFalse(page_map["snapshot"]["live_semantics_ready"])
-            self.assertTrue(page_map["snapshot"]["degraded"])
-            self.assertIn("capture_source_degraded", page_map["snapshot"]["degraded_reasons"])
-            self.assertIn("missing_semantic_ids", page_map["snapshot"]["degraded_reasons"])
-            self.assertIn("degraded=true", page_map_text)
+            self.assertEqual(page_map["snapshot"]["capture_error"]["error_code"], "bridge_http_error")
+            self.assertEqual(page_map["snapshot"]["screen_ids"], [])
+            self.assertNotIn("live_semantics_ready", page_map["snapshot"])
+            self.assertNotIn("degraded", page_map["snapshot"])
+            self.assertNotIn("degraded_reasons", page_map["snapshot"])
 
             self.assertIsNotNone(dictionary_response)
             dictionary = dictionary_response["result"]["structuredContent"]["result_json"]  # type: ignore[index]
             self.assertEqual(dictionary["summary"]["field_stats"]["screen_id"]["value_count"], 0)
             self.assertEqual(dictionary["summary"]["field_stats"]["semantic_id"]["value_count"], 0)
-            self.assertEqual(
-                dictionary["summary"]["recommended_lookup_fields"],
-                ["screen_id", "id", "resource_id", "label", "text", "content_desc"],
-            )
+            self.assertNotIn("recommended_lookup_fields", dictionary["summary"])
+
+    def test_device_open_can_reopen_and_overwrite_persisted_session(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mcp-device-open-reopen-") as tmp:
+            session_file = str(Path(tmp) / "session.json")
+            server = mcp_server.MCPServer(runner=_FailRunner())
+
+            def build_driver(platform: str, app: dict[str, Any], dispatch_commands: bool) -> _RecordingDriver:
+                _ = platform
+                return _RecordingDriver(app=app, dispatch_commands=dispatch_commands)
+
+            with mock.patch("tools.mcp_server._build_device_driver", side_effect=build_driver):
+                first_open = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 86,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "device_open",
+                            "arguments": {
+                                "platform": "android",
+                                "app": "com.example.app",
+                                "dispatch_commands": False,
+                                "persist_session": True,
+                                "session_file": session_file,
+                            },
+                        },
+                    }
+                )
+                second_open = server.handle_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 87,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "device_open",
+                            "arguments": {
+                                "platform": "android",
+                                "app": "com.example.app",
+                                "dispatch_commands": True,
+                                "persist_session": True,
+                                "session_file": session_file,
+                            },
+                        },
+                    }
+                )
+
+            self.assertIsNotNone(first_open)
+            self.assertFalse(first_open["result"]["isError"])  # type: ignore[index]
+            self.assertIsNotNone(second_open)
+            self.assertFalse(second_open["result"]["isError"])  # type: ignore[index]
+
+            persisted = json.loads(Path(session_file).read_text(encoding="utf-8"))
+            self.assertTrue(persisted["dispatch_commands"])
+            self.assertEqual(persisted["app"]["android_package"], "com.example.app")
 
     def test_device_press_selector_can_fail_closed_on_ambiguity(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mcp-device-ambiguous-") as tmp:
@@ -1099,7 +1032,7 @@ class TestMCPServer(unittest.TestCase):
             self.assertEqual(verify_result["verdict"], "fail")
             self.assertEqual(verify_result["error_code"], "assertion_mismatch")
 
-    def test_device_fill_retries_with_full_semantic_snapshot_after_selector_drift(self) -> None:
+    def test_device_fill_retries_with_full_snapshot_after_selector_drift(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mcp-device-fill-retry-") as tmp:
             session_file = str(Path(tmp) / "session.json")
             server = mcp_server.MCPServer(runner=_FailRunner())
@@ -1123,8 +1056,6 @@ class TestMCPServer(unittest.TestCase):
                     }
                 )
                 self.assertIsNotNone(open_response)
-                mcp_server.DEVICE_SESSION_CACHE[session_file].snapshot_cache.clear()
-                driver.raw_snapshot_calls.clear()
 
                 fill_response = server.handle_message(
                     {
@@ -1144,179 +1075,16 @@ class TestMCPServer(unittest.TestCase):
 
             self.assertIsNotNone(fill_response)
             self.assertFalse(fill_response["result"]["isError"])  # type: ignore[index]
-            result_json = fill_response["result"]["structuredContent"]["result_json"]  # type: ignore[index]
-            result = result_json["result"]
-            self.assertEqual(result_json["status"], "ok")
+            result = fill_response["result"]["structuredContent"]["result_json"]["result"]  # type: ignore[index]
             self.assertEqual(result["status"], "ok")
             self.assertEqual(result["selector"], "search.query_input")
             self.assertTrue(result["retry_context"]["attempted_full_snapshot"])
-            self.assertTrue(result["retry_context"]["semantic_retry_preserved"])
-            self.assertTrue(result["retry_context"]["full_snapshot"]["live_semantics_ready"])
-            self.assertEqual(result_json["settlement"]["status"], "settled")
-            self.assertEqual(
-                driver.raw_snapshot_calls[0],
-                {"interactive_only": False, "compact": False, "bridge_first_full": True},
-            )
-            self.assertEqual(
-                driver.raw_snapshot_calls[1:],
-                [
-                    {"interactive_only": False, "compact": False},
-                    {"interactive_only": False, "compact": False},
-                ],
-            )
-
-    def test_device_fill_reports_degraded_retry_when_full_snapshot_falls_back(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="mcp-device-fill-fallback-retry-") as tmp:
-            session_file = str(Path(tmp) / "session.json")
-            server = mcp_server.MCPServer(runner=_FailRunner())
-            driver = _SelectorDriftFallbackDriver(app={"android_package": "com.example.app"}, dispatch_commands=False)
-
-            with mock.patch("tools.mcp_server._build_device_driver", return_value=driver):
-                open_response = server.handle_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 122,
-                        "method": "tools/call",
-                        "params": {
-                            "name": "device_open",
-                            "arguments": {
-                                "platform": "android",
-                                "app": "com.example.app",
-                                "dispatch_commands": False,
-                                "session_file": session_file,
-                            },
-                        },
-                    }
-                )
-                self.assertIsNotNone(open_response)
-                mcp_server.DEVICE_SESSION_CACHE[session_file].snapshot_cache.clear()
-
-                fill_response = server.handle_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 123,
-                        "method": "tools/call",
-                        "params": {
-                            "name": "device_fill",
-                            "arguments": {
-                                "session_file": session_file,
-                                "element": "search.query_input",
-                                "text": "hello",
-                            },
-                        },
-                    }
-                )
-
-            self.assertIsNotNone(fill_response)
-            self.assertTrue(fill_response["result"]["isError"])  # type: ignore[index]
-            result_json = fill_response["result"]["structuredContent"]["result_json"]  # type: ignore[index]
-            result = result_json["result"]
-            self.assertEqual(result_json["status"], "error")
-            self.assertEqual(result["error_code"], "selector_retry_degraded")
-            self.assertTrue(result["degraded"])
-            self.assertTrue(result["retry_context"]["full_snapshot"]["degraded"])
-            self.assertFalse(result["retry_context"]["semantic_retry_preserved"])
-            self.assertIsNone(result_json["settlement"])
-
-    def test_device_press_and_fill_post_action_settlement_stays_semantic(self) -> None:
-        self._assert_post_action_settlement_stays_semantic(
-            tool_name="device_press",
-            arguments={"element": "search.query_input"},
-        )
-        self._assert_post_action_settlement_stays_semantic(
-            tool_name="device_fill",
-            arguments={"element": "search.query_input", "text": "hello"},
-        )
-
-    def test_device_open_reports_settlement_timeout(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="mcp-device-open-timeout-") as tmp:
-            session_file = str(Path(tmp) / "session.json")
-            server = mcp_server.MCPServer(runner=_FailRunner())
-            driver = _NeverSettlesDriver(app={"android_package": "com.example.app"}, dispatch_commands=False)
-
-            with mock.patch("tools.mcp_server._build_device_driver", return_value=driver):
-                open_response = server.handle_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 124,
-                        "method": "tools/call",
-                        "params": {
-                            "name": "device_open",
-                            "arguments": {
-                                "platform": "android",
-                                "app": "com.example.app",
-                                "dispatch_commands": False,
-                                "session_file": session_file,
-                            },
-                        },
-                    }
-                )
-
-            self.assertIsNotNone(open_response)
-            self.assertTrue(open_response["result"]["isError"])  # type: ignore[index]
-            result_json = open_response["result"]["structuredContent"]["result_json"]  # type: ignore[index]
-            self.assertEqual(result_json["status"], "error")
-            self.assertEqual(result_json["settlement"]["status"], "timeout")
-
-    def test_device_open_prefers_semantic_snapshot_for_warm_launch_recovery(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="mcp-device-open-warm-launch-") as tmp:
-            session_file = str(Path(tmp) / "session.json")
-            server = mcp_server.MCPServer(runner=_FailRunner())
-            driver = _WarmLaunchSemanticRecoveryDriver(
-                app={"android_package": "com.example.app"},
-                dispatch_commands=False,
-            )
-
-            with mock.patch("tools.mcp_server._build_device_driver", return_value=driver):
-                open_response = server.handle_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 125,
-                        "method": "tools/call",
-                        "params": {
-                            "name": "device_open",
-                            "arguments": {
-                                "platform": "android",
-                                "app": "com.example.app",
-                                "dispatch_commands": False,
-                                "session_file": session_file,
-                            },
-                        },
-                    }
-                )
-                page_map_response = server.handle_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 126,
-                        "method": "tools/call",
-                        "params": {"name": "device_page_map", "arguments": {"session_file": session_file}},
-                    }
-                )
-
-            self.assertIsNotNone(open_response)
-            self.assertFalse(open_response["result"]["isError"])  # type: ignore[index]
-            open_result = open_response["result"]["structuredContent"]["result_json"]  # type: ignore[index]
-            self.assertEqual(open_result["settlement"]["status"], "settled")
-            self.assertEqual(open_result["settlement"]["screen_id"], "screen.settings")
-            self.assertTrue(open_result["settlement"]["snapshot"]["live_semantics_ready"])
-            self.assertFalse(open_result["settlement"]["degraded"])
+            self.assertTrue(result["retry_context"]["selector_presence"]["semantic_id"])
+            self.assertIn("search", result["retry_context"]["matching_screen_ids"])
             self.assertEqual(
                 driver.raw_snapshot_calls,
-                [
-                    {"interactive_only": False, "compact": False, "bridge_first_full": True},
-                    {"interactive_only": False, "compact": False, "bridge_first_full": True},
-                    {"interactive_only": False, "compact": False, "bridge_first_full": True},
-                ],
+                [{"interactive_only": False, "compact": False, "bridge_first_full": True}],
             )
-
-            self.assertIsNotNone(page_map_response)
-            page_map_result = page_map_response["result"]["structuredContent"]  # type: ignore[index]
-            page_map = page_map_result["result_json"]
-            self.assertTrue(page_map_result["cache_hit"])
-            self.assertEqual(page_map["page"]["screen_id"], "screen.settings")
-            self.assertEqual(page_map["page"]["root"]["id"], "screen.settings")
-            self.assertTrue(page_map["snapshot"]["live_semantics_ready"])
-            self.assertFalse(page_map["snapshot"]["degraded"])
 
 
 if __name__ == "__main__":

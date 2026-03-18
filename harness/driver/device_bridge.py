@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import subprocess
 import time
 from abc import ABC, abstractmethod
@@ -8,8 +7,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from harness.driver.selectors import build_anchor, build_ref, resolve_selector
-
-SEMANTIC_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+$")
 
 
 class DeviceHarness(ABC):
@@ -39,7 +36,7 @@ class DeviceHarness(ABC):
     def snapshot(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         _ = options or {}
         elements = self._build_elements()
-        snapshot = {
+        return {
             "schema_version": "cat.v2",
             "platform": self.platform,
             "captured_at": datetime.now(timezone.utc).isoformat(),
@@ -59,10 +56,6 @@ class DeviceHarness(ABC):
                 "details": "snapshot generated from local harness state",
             },
         }
-        screen_id = self._screen_id_for_snapshot(elements)
-        if screen_id:
-            snapshot["screen_id"] = screen_id
-        return snapshot
 
     def diff(self, before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
         before_map = {el["ref"]: el for el in before.get("elements", [])}
@@ -93,7 +86,7 @@ class DeviceHarness(ABC):
                 }
             )
 
-        attr_fields = {"id", "label", "type", "text", "resource_id", "content_desc", "class_name", "screen_id", "semantic_id"}
+        attr_fields = {"id", "label", "type", "text", "resource_id", "content_desc", "class_name"}
         state_fields = {
             "interactive",
             "clickable",
@@ -238,6 +231,13 @@ class DeviceHarness(ABC):
                 if selector_info is not None:
                     selector_info["tap_coordinates"] = {"x": action_payload["x"], "y": action_payload["y"]}
 
+        if op == "input_text" and "x" not in action_payload and "y" not in action_payload and resolved is not None:
+            coords = self._center_from_bounds(resolved.get("bounds"))
+            if coords is not None:
+                action_payload["x"], action_payload["y"] = coords
+                if selector_info is not None:
+                    selector_info["focus_coordinates"] = {"x": action_payload["x"], "y": action_payload["y"]}
+
         command = self.command_for_action(action_payload)
         if command is None:
             # Assertion actions are handled in verify() and don't dispatch a command.
@@ -275,15 +275,30 @@ class DeviceHarness(ABC):
                 selector = {"by": "id", "value": str(assertion["target"])}
                 target, selector_info = resolve_selector(selector, elements)
 
+            if target is None and selector_info is not None:
+                match_type = str(selector_info.get("match_type", ""))
+                if match_type in {"ambiguous", "ambiguous_within"}:
+                    return {
+                        "status": "fail",
+                        "verdict": "fail",
+                        "error_code": "ambiguous_selector",
+                        "details": "selector matched multiple elements in ambiguity-safe mode",
+                        "selector": selector,
+                        "selector_info": selector_info,
+                        "candidates": selector_info.get("candidates", []),
+                        "snapshot_tree_hash": snapshot.get("tree_hash"),
+                        "elapsed_ms": int((time.monotonic() - started) * 1000),
+                    }
+
             if target is not None:
-                actual = self._primary_actual(target)
+                actual = self._primary_actual(target, elements=elements)
                 last_actual = actual
-                if self._expectation_satisfied(target, expected_text):
+                if self._expectation_satisfied(target, expected_text, elements=elements):
                     return {
                         "status": "ok",
                         "verdict": "pass",
                         "expected": expected_text or "visible",
-                        "actual": actual,
+                        "actual": self._matched_actual(target, expected_text, elements=elements),
                         "selector": selector,
                         "selector_info": selector_info,
                         "snapshot_tree_hash": snapshot.get("tree_hash"),
@@ -348,10 +363,13 @@ class DeviceHarness(ABC):
 
         while True:
             snapshot = self.snapshot(snapshot_options)
-            last_snapshot = snapshot if isinstance(snapshot, dict) else {}
+            if isinstance(snapshot, dict):
+                last_snapshot = snapshot
+            else:
+                last_snapshot = {}
+
             attempts += 1
             fingerprint = self._snapshot_fingerprint(last_snapshot)
-
             if previous_fingerprint is not None and fingerprint == previous_fingerprint:
                 observed_stable += 1
             else:
@@ -454,7 +472,6 @@ class DeviceHarness(ABC):
 
     def _build_elements(self) -> list[dict[str, Any]]:
         nodes: list[dict[str, Any]] = []
-        current_screen_id = self._current_screen_id()
         root = {
             "id": "root",
             "label": self.app_identity(),
@@ -478,8 +495,6 @@ class DeviceHarness(ABC):
             "index_in_parent": 0,
             "source_node_id": "root",
         }
-        if current_screen_id:
-            root["screen_id"] = current_screen_id
         root["ref"] = build_ref(self.platform, root)
         root["anchor"] = build_anchor(root)
         nodes.append(root)
@@ -509,33 +524,10 @@ class DeviceHarness(ABC):
                 "index_in_parent": idx,
                 "source_node_id": target,
             }
-            node_screen_id = target if target.endswith("_screen") else current_screen_id
-            if node_screen_id:
-                node["screen_id"] = node_screen_id
-            semantic_id = self._semantic_id_for_target(target)
-            if semantic_id:
-                node["semantic_id"] = semantic_id
             node["ref"] = build_ref(self.platform, node)
             node["anchor"] = build_anchor(node)
             nodes.append(node)
         return nodes
-
-    def _current_screen_id(self) -> str | None:
-        screen_targets = sorted(target for target in self._visible_targets if target.endswith("_screen"))
-        if not screen_targets:
-            return None
-        non_launch = [target for target in screen_targets if target != "launch_screen"]
-        return non_launch[0] if non_launch else screen_targets[0]
-
-    @staticmethod
-    def _semantic_id_for_target(target: str) -> str | None:
-        return target if SEMANTIC_ID_PATTERN.fullmatch(target) else None
-
-    def _screen_id_for_snapshot(self, elements: list[dict[str, Any]]) -> str | None:
-        explicit = [str(element.get("screen_id")) for element in elements if isinstance(element, dict) and element.get("screen_id")]
-        if explicit:
-            return explicit[0]
-        return self._current_screen_id()
 
     @staticmethod
     def _center_from_bounds(bounds: Any) -> tuple[int, int] | None:
@@ -575,27 +567,89 @@ class DeviceHarness(ABC):
         normalized = expected.strip().lower()
         return normalized in {"", "visible", "exists", "present"}
 
-    def _expectation_satisfied(self, target: dict[str, Any], expected: str) -> bool:
+    @staticmethod
+    def _candidate_variants(value: Any) -> list[str]:
+        if value is None:
+            return []
+        text = str(value).strip()
+        if not text:
+            return []
+        variants = [text]
+        if ", " in text:
+            suffix = text.split(", ", 1)[1].strip()
+            if suffix and suffix not in variants:
+                variants.append(suffix)
+        if ":" in text:
+            suffix = text.split(":", 1)[1].strip()
+            if suffix and suffix not in variants:
+                variants.append(suffix)
+        return variants
+
+    def _expectation_satisfied(
+        self,
+        target: dict[str, Any],
+        expected: str,
+        *,
+        elements: list[dict[str, Any]] | None = None,
+    ) -> bool:
         if self._is_presence_expectation(expected):
             return True
-        for candidate in self._actual_candidates(target):
+        for candidate in self._actual_candidates(target, elements=elements):
             if candidate == expected:
                 return True
         return False
 
-    @staticmethod
-    def _actual_candidates(target: dict[str, Any]) -> list[str]:
-        fields = ("text", "label", "semantic_id", "screen_id", "id", "content_desc", "resource_id", "class_name", "type")
+    def _actual_candidates(
+        self,
+        target: dict[str, Any],
+        *,
+        elements: list[dict[str, Any]] | None = None,
+    ) -> list[str]:
+        fields = ("text", "label", "id", "content_desc", "resource_id", "class_name", "type")
         candidates: list[str] = []
+        seen: set[str] = set()
+
+        def append_value(value: Any) -> None:
+            for candidate in self._candidate_variants(value):
+                if candidate not in seen:
+                    seen.add(candidate)
+                    candidates.append(candidate)
+
         for field in fields:
-            value = target.get(field)
-            if value is None:
-                continue
-            text = str(value)
-            if text:
-                candidates.append(text)
+            append_value(target.get(field))
+
+        target_path = str(target.get("path", ""))
+        if target_path and isinstance(elements, list):
+            descendant_fields = ("text", "label", "content_desc", "id", "resource_id")
+            for element in elements:
+                if not isinstance(element, dict) or element is target:
+                    continue
+                path = str(element.get("path", ""))
+                if not path.startswith(f"{target_path}/"):
+                    continue
+                for field in descendant_fields:
+                    append_value(element.get(field))
         return candidates
 
-    def _primary_actual(self, target: dict[str, Any]) -> str:
-        candidates = self._actual_candidates(target)
+    def _matched_actual(
+        self,
+        target: dict[str, Any],
+        expected: str,
+        *,
+        elements: list[dict[str, Any]] | None = None,
+    ) -> str:
+        if self._is_presence_expectation(expected):
+            return self._primary_actual(target, elements=elements)
+        for candidate in self._actual_candidates(target, elements=elements):
+            if candidate == expected:
+                return candidate
+        return self._primary_actual(target, elements=elements)
+
+    def _primary_actual(
+        self,
+        target: dict[str, Any],
+        *,
+        elements: list[dict[str, Any]] | None = None,
+    ) -> str:
+        candidates = self._actual_candidates(target, elements=elements)
         return candidates[0] if candidates else ""

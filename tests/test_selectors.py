@@ -164,6 +164,83 @@ class TestSelectors(unittest.TestCase):
         self.assertEqual(info["fallback_field"], "id")
         self.assertEqual(info["candidate_count"], 1)
 
+    def test_id_selector_can_fail_closed_on_ambiguity(self) -> None:
+        elements = [
+            {"ref": "@e1", "id": "dup", "label": "Save", "path": "0/2"},
+            {"ref": "@e2", "id": "dup", "label": "Save", "path": "0/1"},
+        ]
+
+        matched, info = resolve_selector(
+            {"by": "id", "value": "dup", "ambiguity_mode": "error", "candidate_limit": 2},
+            elements,
+        )
+        self.assertIsNone(matched)
+        self.assertEqual(info["match_type"], "ambiguous")
+        self.assertEqual(info["candidate_count"], 2)
+        self.assertEqual([item["ref"] for item in info["candidates"]], ["@e2", "@e1"])
+
+    def test_within_can_fail_closed_on_ambiguous_container(self) -> None:
+        elements = [
+            {"ref": "@e0", "id": "root", "path": "0"},
+            {"ref": "@e1", "id": "panel", "path": "0/1"},
+            {"ref": "@e2", "id": "panel", "path": "0/2"},
+            {"ref": "@e3", "id": "button", "label": "Submit", "path": "0/1/0"},
+            {"ref": "@e4", "id": "button", "label": "Submit", "path": "0/2/0"},
+        ]
+
+        matched, info = resolve_selector(
+            {"by": "id", "value": "button", "within": "panel", "ambiguity_mode": "error"},
+            elements,
+        )
+        self.assertIsNone(matched)
+        self.assertEqual(info["match_type"], "ambiguous_within")
+        self.assertEqual(info["candidate_count"], 2)
+
+    def test_anchor_tie_can_fail_closed(self) -> None:
+        elements = [
+            {
+                "ref": "@e1",
+                "id": "save_primary",
+                "label": "Save",
+                "type": "button",
+                "text": "Save",
+                "path": "0/1",
+                "resource_id": "save_primary",
+                "class_name": "android.widget.Button",
+                "content_desc": "save",
+                "bounds": [0, 0, 50, 20],
+            },
+            {
+                "ref": "@e2",
+                "id": "save_secondary",
+                "label": "Save",
+                "type": "button",
+                "text": "Save",
+                "path": "0/2",
+                "resource_id": "save_secondary",
+                "class_name": "android.widget.Button",
+                "content_desc": "save",
+                "bounds": [60, 0, 110, 20],
+            },
+        ]
+        selector = {
+            "by": "ref",
+            "value": "@emissing",
+            "ambiguity_mode": "error",
+            "anchor": {
+                "label": "Save",
+                "type": "button",
+                "text": "Save",
+                "class_name": "android.widget.Button",
+                "content_desc": "save",
+            },
+        }
+
+        matched, info = resolve_selector(selector, elements, score_threshold=0.4)
+        self.assertIsNone(matched)
+        self.assertEqual(info["match_type"], "ambiguous")
+        self.assertEqual(info["candidate_count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

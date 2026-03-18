@@ -34,13 +34,42 @@ def build_anchor(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def make_selector(by: str, value: str, within: str | None = None, platform_hint: str | None = None) -> dict[str, Any]:
+def make_selector(
+    by: str,
+    value: str,
+    within: str | None = None,
+    platform_hint: str | None = None,
+    anchor: dict[str, Any] | None = None,
+    ambiguity_mode: str | None = None,
+    candidate_limit: int | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {"by": by, "value": value}
     if within:
         payload["within"] = within
     if platform_hint:
         payload["platform_hint"] = platform_hint
+    if anchor:
+        payload["anchor"] = anchor
+    if ambiguity_mode:
+        payload["ambiguity_mode"] = ambiguity_mode
+    if candidate_limit is not None:
+        payload["candidate_limit"] = candidate_limit
     return payload
+
+
+def _candidate_summary(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ref": node.get("ref"),
+        "id": node.get("id"),
+        "label": node.get("label"),
+        "path": node.get("path"),
+        "resource_id": node.get("resource_id"),
+        "text": node.get("text"),
+        "content_desc": node.get("content_desc"),
+        "class_name": node.get("class_name"),
+        "type": node.get("type"),
+        "bounds": node.get("bounds"),
+    }
 
 
 def _anchor_score(anchor: dict[str, Any], node: dict[str, Any]) -> float:
@@ -147,6 +176,9 @@ def _semantic_id_fallback(
 def _scope_elements_within(
     selector: dict[str, Any],
     elements: list[dict[str, Any]],
+    *,
+    ambiguity_mode: str,
+    candidate_limit: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     within = selector.get("within")
     if not within:
@@ -154,12 +186,22 @@ def _scope_elements_within(
 
     within_value = str(within)
     if within_value.startswith("@e"):
-        within_element = next((el for el in elements if el.get("ref") == within_value), None)
+        within_candidates = [el for el in elements if el.get("ref") == within_value]
     else:
-        within_element = next((el for el in elements if str(el.get("id", "")) == within_value), None)
+        within_candidates = [el for el in elements if str(el.get("id", "")) == within_value]
 
-    if not within_element:
+    if not within_candidates:
         return [], {"candidate_count": 0, "confidence": 0.0, "match_type": "not_found"}
+
+    within_candidates.sort(key=lambda item: str(item.get("path", "")))
+    if len(within_candidates) > 1 and ambiguity_mode == "error":
+        return [], {
+            "candidate_count": len(within_candidates),
+            "confidence": 0.0,
+            "match_type": "ambiguous_within",
+            "candidates": [_candidate_summary(item) for item in within_candidates[: max(1, candidate_limit)]],
+        }
+    within_element = within_candidates[0]
 
     within_path = str(within_element.get("path", ""))
     if not within_path:
@@ -175,8 +217,27 @@ def resolve_selector(
     elements: list[dict[str, Any]],
     *,
     score_threshold: float = 0.75,
+    ambiguity_mode: str | None = None,
+    candidate_limit: int | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    elements, scope_info = _scope_elements_within(selector, elements)
+    resolved_ambiguity_mode = ambiguity_mode or str(selector.get("ambiguity_mode") or "first")
+    if resolved_ambiguity_mode not in {"first", "error"}:
+        resolved_ambiguity_mode = "first"
+    resolved_candidate_limit = candidate_limit
+    if resolved_candidate_limit is None:
+        raw_limit = selector.get("candidate_limit")
+        try:
+            resolved_candidate_limit = int(raw_limit) if raw_limit is not None else 5
+        except (TypeError, ValueError):
+            resolved_candidate_limit = 5
+    resolved_candidate_limit = max(1, resolved_candidate_limit)
+
+    elements, scope_info = _scope_elements_within(
+        selector,
+        elements,
+        ambiguity_mode=resolved_ambiguity_mode,
+        candidate_limit=resolved_candidate_limit,
+    )
     if scope_info is not None:
         return None, scope_info
     if selector.get("within") and not elements:
@@ -200,6 +261,18 @@ def resolve_selector(
         scored.sort(key=lambda item: item[1], reverse=True)
         best, score = scored[0]
         if score >= score_threshold:
+            if (
+                resolved_ambiguity_mode == "error"
+                and len(scored) > 1
+                and scored[1][1] == score
+            ):
+                candidates = [item[0] for item in scored if item[1] == score]
+                return None, {
+                    "candidate_count": len(candidates),
+                    "confidence": score,
+                    "match_type": "ambiguous",
+                    "candidates": [_candidate_summary(item) for item in candidates[:resolved_candidate_limit]],
+                }
             return best, {"candidate_count": len(scored), "confidence": score, "match_type": "anchor"}
         return None, {"candidate_count": len(scored), "confidence": score, "match_type": "drift"}
 
@@ -233,4 +306,12 @@ def resolve_selector(
     if not candidates:
         return None, {"candidate_count": 0, "confidence": 0.0, "match_type": "not_found"}
 
+    candidates = _sorted_candidates(candidates)
+    if len(candidates) > 1 and resolved_ambiguity_mode == "error":
+        return None, {
+            "candidate_count": len(candidates),
+            "confidence": 0.85,
+            "match_type": "ambiguous",
+            "candidates": [_candidate_summary(item) for item in candidates[:resolved_candidate_limit]],
+        }
     return _resolved_match(candidates, match_type=str(by), confidence=confidence)

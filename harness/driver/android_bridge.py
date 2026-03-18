@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 import uuid
@@ -128,6 +129,117 @@ class AndroidTreeClient:
             **result,
         }
 
+    @staticmethod
+    def _parse_listener_port(value: str) -> int | None:
+        if not value:
+            return None
+        if value.startswith("[") and "]:" in value:
+            candidate = value.rsplit("]:", 1)[-1]
+        else:
+            candidate = value.rsplit(":", 1)[-1]
+        try:
+            return int(candidate)
+        except ValueError:
+            return None
+
+    def collect_runtime_diagnostics(self, app_package: str) -> dict[str, Any]:
+        pid_result = self._run_adb(["shell", "pidof", app_package])
+        app_pid: str | None = None
+        if pid_result["returncode"] == 0:
+            stdout = str(pid_result.get("stdout", "")).strip()
+            if stdout:
+                app_pid = stdout.split()[0]
+
+        ss_result = self._run_adb(["shell", "ss", "-lntp"])
+        entries: list[dict[str, Any]] = []
+        if ss_result["returncode"] == 0:
+            for line in str(ss_result.get("stdout", "")).splitlines():
+                text = line.strip()
+                if not text.startswith("LISTEN"):
+                    continue
+                parts = text.split()
+                if len(parts) < 4:
+                    continue
+                local = parts[3]
+                pid_match = re.search(r"pid=(\d+)", text)
+                process_match = re.search(r'"([^"]+)"', text)
+                local_port = self._parse_listener_port(local)
+                entry: dict[str, Any] = {
+                    "local": local,
+                    "local_port": local_port,
+                    "pid": pid_match.group(1) if pid_match else None,
+                    "process": process_match.group(1) if process_match else None,
+                    "matches_remote_port": local_port == self.config.remote_port,
+                    "matches_app_pid": bool(app_pid and pid_match and pid_match.group(1) == app_pid),
+                }
+                entries.append(entry)
+
+        remote_port_entries = [entry for entry in entries if entry.get("matches_remote_port")]
+        remote_port_owned_by_app = any(entry.get("matches_remote_port") and entry.get("matches_app_pid") for entry in entries)
+        return {
+            "status": "ok" if ss_result["returncode"] == 0 else "error",
+            "app_process": {
+                "package": app_package,
+                "pid": app_pid,
+                "running": app_pid is not None,
+                "pidof": pid_result,
+            },
+            "bridge_port": {
+                "port": self.config.remote_port,
+                "listening": bool(remote_port_entries),
+                "owned_by_app": remote_port_owned_by_app,
+                "listeners": remote_port_entries,
+            },
+            "ss": ss_result,
+        }
+
+    def _classify_runtime_failure(
+        self,
+        *,
+        app_package: str,
+        bridge_error_code: str,
+        details: str,
+        trace: dict[str, Any],
+        health_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        runtime = self.collect_runtime_diagnostics(app_package)
+        trace["runtime"] = runtime
+
+        app_process = runtime.get("app_process", {}) if isinstance(runtime, dict) else {}
+        bridge_port = runtime.get("bridge_port", {}) if isinstance(runtime, dict) else {}
+        app_running = bool(app_process.get("running"))
+        port_listening = bool(bridge_port.get("listening"))
+        port_owned_by_app = bool(bridge_port.get("owned_by_app"))
+
+        error_code = bridge_error_code
+        classified_details = details
+        if not app_running:
+            error_code = "app_not_running"
+            classified_details = "target app process is not running"
+        elif not port_listening:
+            error_code = "bridge_port_not_listening"
+            classified_details = f"target app process is running but bridge port {self.config.remote_port} is not listening"
+        elif not port_owned_by_app:
+            error_code = "bridge_port_not_listening"
+            classified_details = f"bridge port {self.config.remote_port} is listening but not owned by the target app process"
+
+        payload: dict[str, Any] = {
+            "status": "error",
+            "error_code": error_code,
+            "details": classified_details,
+            "bridge_status": "error",
+            "bridge_error_code": bridge_error_code,
+            "bridge_http_status": trace.get("http", {}).get("http_status") if isinstance(trace.get("http"), dict) else None,
+            "capture_trace": trace,
+        }
+        if health_payload is not None:
+            payload["health_payload"] = health_payload
+        return payload
+
+    def _attach_runtime_trace(self, trace: dict[str, Any], app_package: str) -> dict[str, Any]:
+        trace["runtime"] = self.collect_runtime_diagnostics(app_package)
+        return trace
+
     def _request_json(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         body: bytes | None = None
         headers = {"Accept": "application/json"}
@@ -216,19 +328,17 @@ class AndroidTreeClient:
         trace["http"] = response
         if response["status"] != "ok":
             trace["adb_forward_list"] = self.list_port_forwards()
-            return {
-                "status": "error",
-                "error_code": response["error_code"],
-                "details": response.get("details", "bridge health request failed"),
-                "bridge_status": "error",
-                "bridge_error_code": response["error_code"],
-                "bridge_http_status": response.get("http_status"),
-                "capture_trace": trace,
-            }
+            return self._classify_runtime_failure(
+                app_package=app_package,
+                bridge_error_code=str(response["error_code"]),
+                details=str(response.get("details", "bridge health request failed")),
+                trace=trace,
+            )
 
         body = response.get("body")
         if not isinstance(body, dict):
             trace["adb_forward_list"] = self.list_port_forwards()
+            self._attach_runtime_trace(trace, app_package)
             return {
                 "status": "error",
                 "error_code": "bridge_protocol_invalid",
@@ -248,6 +358,7 @@ class AndroidTreeClient:
         bridge_package = str(body.get("package", ""))
         if not ready or (bridge_package and bridge_package != app_package):
             trace["adb_forward_list"] = self.list_port_forwards()
+            self._attach_runtime_trace(trace, app_package)
             return {
                 "status": "error",
                 "error_code": "bridge_not_integrated",
@@ -305,21 +416,20 @@ class AndroidTreeClient:
         response = self._request_json("POST", "/tree/snapshot", payload=payload)
         trace["http"] = response
         if response["status"] != "ok":
-            return {
-                "status": "error",
-                "request_id": request_id,
-                "error_code": response["error_code"],
-                "details": response.get("details", "bridge snapshot request failed"),
-                "bridge_status": "error",
-                "bridge_error_code": response["error_code"],
-                "bridge_http_status": response.get("http_status"),
-                "capture_trace": trace,
-                "payload": None,
-                "latency_ms": response.get("latency_ms", 0),
-            }
+            classified = self._classify_runtime_failure(
+                app_package=app_package,
+                bridge_error_code=str(response["error_code"]),
+                details=str(response.get("details", "bridge snapshot request failed")),
+                trace=trace,
+            )
+            classified["request_id"] = request_id
+            classified["payload"] = None
+            classified["latency_ms"] = response.get("latency_ms", 0)
+            return classified
 
         body = response.get("body")
         if not isinstance(body, dict):
+            self._attach_runtime_trace(trace, app_package)
             return {
                 "status": "error",
                 "request_id": request_id,
@@ -335,6 +445,7 @@ class AndroidTreeClient:
 
         nodes = body.get("nodes")
         if not isinstance(nodes, list):
+            self._attach_runtime_trace(trace, app_package)
             return {
                 "status": "error",
                 "request_id": request_id,

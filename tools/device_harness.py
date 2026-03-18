@@ -27,7 +27,45 @@ def _load_session(path: Path) -> dict[str, Any]:
 
 
 def _save_session(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+
+
+def _normalize_global_options(argv: list[str]) -> list[str]:
+    """Allow global options like --session-file to appear after the subcommand."""
+    extracted: list[str] = []
+    remaining: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--session-file":
+            if index + 1 >= len(argv):
+                raise SystemExit("argument --session-file: expected one argument")
+            extracted.extend(argv[index : index + 2])
+            index += 2
+            continue
+        remaining.append(token)
+        index += 1
+    return extracted + remaining
+
+
+def _open_summary(status: str, launch: dict[str, Any], preflight: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": status,
+        "launch": {
+            "status": launch.get("status"),
+            "returncode": launch.get("returncode"),
+            "details": launch.get("details"),
+            "command": launch.get("command"),
+        },
+        "preflight": {
+            "status": preflight.get("status"),
+            "details": preflight.get("details"),
+            "bridge_status": preflight.get("bridge_status"),
+            "bridge_error_code": preflight.get("bridge_error_code"),
+            "bridge_http_status": preflight.get("bridge_http_status"),
+        },
+    }
 
 
 def _build_driver(session: dict[str, Any]) -> AndroidDriver | IOSDriver:
@@ -149,7 +187,7 @@ def _find_elements(
     exact: bool = False,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    search_fields = ("id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type")
+    search_fields = ("semantic_id", "id", "label", "text", "content_desc", "resource_id", "ref", "class_name", "type")
     if field != "any":
         if field not in search_fields:
             raise SystemExit(f"unsupported field: {field}")
@@ -220,14 +258,6 @@ def cmd_open(args: argparse.Namespace) -> None:
 
     launch = driver.interact({"action": "launch_app"})
     preflight = _retry_android_preflight(driver)
-    session = {
-        "platform": args.platform,
-        "app": app,
-        "dispatch_commands": dispatch_commands,
-        "state": driver.dump_state(),
-        "snapshot_cache": {},
-    }
-    _save_session(Path(args.session_file), session)
     launch_failed = launch.get("status") in {"error", "fail"}
     if (
         args.platform == "android"
@@ -242,11 +272,22 @@ def cmd_open(args: argparse.Namespace) -> None:
     status = "ok"
     if launch_failed or preflight.get("status") in {"error", "fail"}:
         status = "error"
+    session = {
+        "platform": args.platform,
+        "app": app,
+        "dispatch_commands": dispatch_commands,
+        "state": driver.dump_state(),
+        "snapshot_cache": {},
+        "last_open": _open_summary(status, launch, preflight),
+    }
+    _save_session(Path(args.session_file), session)
     print(
         json.dumps(
             {
                 "status": status,
                 "operation": "open",
+                "session_file": str(Path(args.session_file)),
+                "session_summary": session["last_open"],
                 "result": {"launch": launch, "preflight": preflight},
             },
             indent=2,
@@ -270,7 +311,17 @@ def cmd_snapshot(args: argparse.Namespace) -> None:
     )
     session["state"] = driver.dump_state()
     _save_session(Path(args.session_file), session)
-    print(json.dumps({"cache_hit": cache_hit, "snapshot": snapshot}, indent=2, ensure_ascii=True))
+    print(
+        json.dumps(
+            {
+                "cache_hit": cache_hit,
+                "session_file": str(Path(args.session_file)),
+                "snapshot": snapshot,
+            },
+            indent=2,
+            ensure_ascii=True,
+        )
+    )
 
 
 def cmd_list(args: argparse.Namespace) -> None:
@@ -288,7 +339,17 @@ def cmd_list(args: argparse.Namespace) -> None:
     session["state"] = driver.dump_state()
     _save_session(Path(args.session_file), session)
     elements = _compact_elements(snapshot)
-    print(json.dumps({"cache_hit": cache_hit, "elements": elements}, indent=2, ensure_ascii=True))
+    print(
+        json.dumps(
+            {
+                "cache_hit": cache_hit,
+                "session_file": str(Path(args.session_file)),
+                "elements": elements,
+            },
+            indent=2,
+            ensure_ascii=True,
+        )
+    )
 
 
 def cmd_find(args: argparse.Namespace) -> None:
@@ -315,7 +376,17 @@ def cmd_find(args: argparse.Namespace) -> None:
     )
     session["state"] = driver.dump_state()
     _save_session(Path(args.session_file), session)
-    print(json.dumps({"cache_hit": cache_hit, "matches": matches}, indent=2, ensure_ascii=True))
+    print(
+        json.dumps(
+            {
+                "cache_hit": cache_hit,
+                "session_file": str(Path(args.session_file)),
+                "matches": matches,
+            },
+            indent=2,
+            ensure_ascii=True,
+        )
+    )
 
 
 def cmd_press(args: argparse.Namespace) -> None:
@@ -326,11 +397,28 @@ def cmd_press(args: argparse.Namespace) -> None:
     selector = _selector_from_value(args.element, session["platform"])
     cached_elements = _cached_elements(session)
     result = driver.interact({"action": "tap", "selector": selector}, elements=cached_elements)
+    if result.get("status") in {"error", "fail"} and result.get("error_code") == "selector_drift":
+        full_snapshot = driver.snapshot()
+        full_elements = full_snapshot.get("elements", []) if isinstance(full_snapshot, dict) else []
+        if not isinstance(full_elements, list):
+            full_elements = []
+        result = driver.interact({"action": "tap", "selector": selector}, elements=full_elements)
     if result.get("status") not in {"error", "fail"}:
         _invalidate_snapshot_cache(session)
     session["state"] = driver.dump_state()
     _save_session(Path(args.session_file), session)
-    print(json.dumps({"status": "ok", "operation": "press", "result": result}, indent=2, ensure_ascii=True))
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "operation": "press",
+                "session_file": str(Path(args.session_file)),
+                "result": result,
+            },
+            indent=2,
+            ensure_ascii=True,
+        )
+    )
 
 
 def cmd_fill(args: argparse.Namespace) -> None:
@@ -341,11 +429,31 @@ def cmd_fill(args: argparse.Namespace) -> None:
     selector = _selector_from_value(args.element, session["platform"])
     cached_elements = _cached_elements(session)
     result = driver.interact({"action": "input_text", "selector": selector, "text": args.text}, elements=cached_elements)
+    if result.get("status") in {"error", "fail"} and result.get("error_code") == "selector_drift":
+        full_snapshot = driver.snapshot()
+        full_elements = full_snapshot.get("elements", []) if isinstance(full_snapshot, dict) else []
+        if not isinstance(full_elements, list):
+            full_elements = []
+        result = driver.interact(
+            {"action": "input_text", "selector": selector, "text": args.text},
+            elements=full_elements,
+        )
     if result.get("status") not in {"error", "fail"}:
         _invalidate_snapshot_cache(session)
     session["state"] = driver.dump_state()
     _save_session(Path(args.session_file), session)
-    print(json.dumps({"status": "ok", "operation": "fill", "result": result}, indent=2, ensure_ascii=True))
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "operation": "fill",
+                "session_file": str(Path(args.session_file)),
+                "result": result,
+            },
+            indent=2,
+            ensure_ascii=True,
+        )
+    )
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -363,10 +471,22 @@ def cmd_verify(args: argparse.Namespace) -> None:
     result = driver.verify(assertion)
     session["state"] = driver.dump_state()
     _save_session(Path(args.session_file), session)
-    print(json.dumps({"status": "ok", "operation": "verify", "result": result}, indent=2, ensure_ascii=True))
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "operation": "verify",
+                "session_file": str(Path(args.session_file)),
+                "result": result,
+            },
+            indent=2,
+            ensure_ascii=True,
+        )
+    )
 
 
 def main() -> None:
+    argv = _normalize_global_options(sys.argv[1:])
     parser = argparse.ArgumentParser(description="Unified mobile harness CLI for iOS and Android.")
     parser.add_argument("--session-file", default=".device_harness_session.json")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -409,7 +529,7 @@ def main() -> None:
     verify_parser.add_argument("--timeout-ms", type=int, default=5000)
     verify_parser.set_defaults(func=cmd_verify)
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.func(args)
 
 

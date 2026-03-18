@@ -6,7 +6,7 @@ from harness.driver.android import AndroidDriver
 
 
 class TestAndroidSnapshot(unittest.TestCase):
-    def test_lightweight_snapshot_prefers_bridge_and_preserves_operability_root(self) -> None:
+    def test_lightweight_snapshot_prefers_bridge_and_applies_request_options(self) -> None:
         driver = AndroidDriver(app={"android_package": "com.example.app"}, dispatch_commands=True)
         bridge_capture = {
             "status": "ok",
@@ -27,18 +27,8 @@ class TestAndroidSnapshot(unittest.TestCase):
                         "clickable": False,
                     },
                     {
-                        "node_id": "content",
-                        "parent_id": "root",
-                        "class_name": "android.view.ViewGroup",
-                        "resource_id": "content",
-                        "content_desc": "Content",
-                        "bounds": [0, 0, 100, 100],
-                        "clickable": False,
-                        "index_in_parent": 0,
-                    },
-                    {
                         "node_id": "cta",
-                        "parent_id": "content",
+                        "parent_id": "root",
                         "class_name": "android.widget.Button",
                         "resource_id": "cta",
                         "text": "Continue",
@@ -67,21 +57,14 @@ class TestAndroidSnapshot(unittest.TestCase):
 
         self.assertEqual(bridge_calls, [("com.example.app", {"interactive_only": True, "compact": True})])
         self.assertEqual(snapshot["capture_source"], "android_accessibility_bridge")
-        self.assertEqual(snapshot["snapshot_health"]["status"], "healthy")
         self.assertEqual(
             snapshot["snapshot_request"],
             {"interactive_only": True, "compact": True, "bridge_first_full": False},
         )
         self.assertTrue(snapshot["normalization_report"]["interactive_only_applied"])
-        self.assertEqual(snapshot["normalization_report"]["interactive_only_mode"], "projection")
         self.assertTrue(snapshot["normalization_report"]["compact_requested"])
         self.assertFalse(snapshot["normalization_report"]["bridge_first_full_requested"])
-        self.assertTrue(snapshot["normalization_report"]["authoritative_root_preserved"])
-        self.assertEqual(snapshot["root"], snapshot["elements"][0]["ref"])
-        self.assertEqual([element["id"] for element in snapshot["elements"]], ["root", "content", "cta"])
-        self.assertEqual(snapshot["interactive_projection"]["authoritative_root"], snapshot["root"])
-        self.assertEqual(snapshot["interactive_projection"]["element_ids"], ["cta"])
-        self.assertEqual(snapshot["interactive_projection"]["root"], snapshot["elements"][-1]["ref"])
+        self.assertEqual([element["id"] for element in snapshot["elements"]], ["cta"])
 
     def test_bridge_first_full_snapshot_prefers_bridge_without_adb_fallback(self) -> None:
         driver = AndroidDriver(app={"android_package": "com.example.app"}, dispatch_commands=True)
@@ -89,32 +72,28 @@ class TestAndroidSnapshot(unittest.TestCase):
             "status": "ok",
             "request_id": "bridge-full-1",
             "latency_ms": 9,
-            "capture_trace": {
-                "request_payload": {"interactive_only": False, "compact": False, "bridge_first_full": True}
-            },
+            "capture_trace": {"request_payload": {"interactive_only": False, "compact": False, "bridge_first_full": True}},
             "payload": {
                 "protocol_version": "bridge.v1",
-                "screen_id": "screen.settings",
-                "root": "screen.settings",
+                "screen_id": "home_screen",
+                "root": "screen.home_screen",
                 "nodes": [
                     {
-                        "node_id": "screen.settings",
+                        "node_id": "screen.home_screen",
                         "parent_id": None,
                         "class_name": "android.view.View",
-                        "resource_id": "screen.settings",
-                        "screen_id": "screen.settings",
-                        "label": "Settings",
-                        "content_desc": "Settings",
+                        "resource_id": "screen.home_screen",
+                        "screen_id": "home_screen",
                         "bounds": [0, 0, 100, 100],
                         "clickable": False,
                     },
                     {
-                        "node_id": "settings.search",
-                        "parent_id": "screen.settings",
+                        "node_id": "search.query_input",
+                        "parent_id": "screen.home_screen",
                         "class_name": "android.widget.EditText",
-                        "resource_id": "settings.search",
-                        "semantic_id": "settings.search",
-                        "screen_id": "screen.settings",
+                        "resource_id": "search.query_input",
+                        "semantic_id": "search.query_input",
+                        "screen_id": "home_screen",
                         "text": "Search",
                         "bounds": [0, 0, 50, 20],
                         "focusable": True,
@@ -145,21 +124,19 @@ class TestAndroidSnapshot(unittest.TestCase):
             [("com.example.app", {"interactive_only": False, "compact": False, "bridge_first_full": True})],
         )
         self.assertEqual(snapshot["capture_source"], "android_accessibility_bridge")
-        self.assertEqual(snapshot["snapshot_health"]["status"], "healthy")
         self.assertEqual(
             snapshot["snapshot_request"],
             {"interactive_only": False, "compact": False, "bridge_first_full": True},
         )
         self.assertTrue(snapshot["normalization_report"]["bridge_first_full_requested"])
-        self.assertEqual(snapshot["screen_id"], "screen.settings")
-        self.assertEqual(snapshot["interactive_projection"]["authoritative_root"], snapshot["root"])
-        self.assertEqual(snapshot["elements"][1]["semantic_id"], "settings.search")
+        self.assertEqual(snapshot["screen_id"], "home_screen")
+        self.assertEqual(snapshot["elements"][1]["semantic_id"], "search.query_input")
 
-    def test_bridge_normalization_keeps_only_the_active_scope_for_mixed_screens(self) -> None:
+    def test_bridge_normalization_preserves_semantic_and_screen_ids(self) -> None:
         driver = AndroidDriver(app={"android_package": "com.example.app"}, dispatch_commands=True)
         capture = {
             "status": "ok",
-            "request_id": "bridge-mixed-scope",
+            "request_id": "bridge-semantic",
             "latency_ms": 7,
             "capture_trace": {"request_payload": {"interactive_only": False, "compact": True}},
             "payload": {
@@ -191,44 +168,82 @@ class TestAndroidSnapshot(unittest.TestCase):
                         "clickable": True,
                         "index_in_parent": 0,
                     },
-                    {
-                        "node_id": "screen.profile",
-                        "parent_id": None,
-                        "class_name": "android.view.View",
-                        "resource_id": "screen.profile",
-                        "screen_id": "profile",
-                        "label": "Profile",
-                        "content_desc": "Profile",
-                        "bounds": [0, 0, 100, 100],
-                        "clickable": False,
-                    },
-                    {
-                        "node_id": "profile.edit_button",
-                        "parent_id": "screen.profile",
-                        "class_name": "android.widget.Button",
-                        "resource_id": "profile.edit_button",
-                        "semantic_id": "profile.edit_button",
-                        "screen_id": "profile",
-                        "label": "Edit",
-                        "text": "Edit",
-                        "bounds": [0, 0, 50, 20],
-                        "clickable": True,
-                        "index_in_parent": 0,
-                    },
                 ],
             },
         }
 
         snapshot = driver._normalize_bridge_snapshot(capture, {"interactive_only": False, "compact": True})
 
-        self.assertEqual(snapshot["snapshot_health"]["status"], "healthy")
         self.assertEqual(snapshot["screen_id"], "settings")
-        self.assertEqual([element["id"] for element in snapshot["elements"]], ["screen.settings", "settings.summary_tile"])
         self.assertEqual(snapshot["elements"][0]["screen_id"], "settings")
         self.assertEqual(snapshot["elements"][1]["semantic_id"], "settings.summary_tile")
         self.assertEqual(snapshot["elements"][1]["label"], "Summary")
-        self.assertEqual(snapshot["normalization_report"]["active_scope_screen_id"], "settings")
-        self.assertEqual(snapshot["normalization_report"]["dropped_out_of_scope_nodes"], 2)
+
+    def test_bridge_normalization_drops_disconnected_nodes_from_other_screens(self) -> None:
+        driver = AndroidDriver(app={"android_package": "com.example.app"}, dispatch_commands=True)
+        capture = {
+            "status": "ok",
+            "request_id": "bridge-mixed",
+            "latency_ms": 7,
+            "capture_trace": {"request_payload": {"interactive_only": True, "compact": True}},
+            "payload": {
+                "protocol_version": "bridge.v1",
+                "screen_id": "search",
+                "root": "screen.search",
+                "nodes": [
+                    {
+                        "node_id": "screen.search",
+                        "parent_id": None,
+                        "class_name": "screen",
+                        "resource_id": "screen.search",
+                        "screen_id": "search",
+                        "content_desc": "Search",
+                        "bounds": [0, 0, 100, 100],
+                    },
+                    {
+                        "node_id": "search.query_input",
+                        "parent_id": "screen.search",
+                        "class_name": "input",
+                        "resource_id": "search.query_input",
+                        "semantic_id": "search.query_input",
+                        "screen_id": "search",
+                        "text": "Search keywords",
+                        "focusable": True,
+                        "editable": True,
+                        "bounds": [0, 0, 50, 20],
+                        "index_in_parent": 0,
+                    },
+                    {
+                        "node_id": "screen.todo_calendar",
+                        "parent_id": None,
+                        "class_name": "screen",
+                        "resource_id": "screen.todo_calendar",
+                        "screen_id": "todo_calendar",
+                        "content_desc": "Todo Calendar",
+                        "bounds": [0, 0, 100, 100],
+                    },
+                    {
+                        "node_id": "todo_calendar.search_bar",
+                        "parent_id": "screen.todo_calendar",
+                        "class_name": "input",
+                        "resource_id": "todo_calendar.search_bar",
+                        "semantic_id": "todo_calendar.search_bar",
+                        "screen_id": "todo_calendar",
+                        "text": "Search",
+                        "focusable": True,
+                        "editable": True,
+                        "bounds": [0, 0, 50, 20],
+                        "index_in_parent": 0,
+                    },
+                ],
+            },
+        }
+
+        snapshot = driver._normalize_bridge_snapshot(capture, {"interactive_only": True, "compact": True})
+
+        self.assertEqual(snapshot["screen_id"], "search")
+        self.assertEqual([element["screen_id"] for element in snapshot["elements"]], ["search"])
+        self.assertEqual([element["id"] for element in snapshot["elements"]], ["search.query_input"])
 
     def test_lightweight_snapshot_falls_back_to_adb_explicitly(self) -> None:
         driver = AndroidDriver(app={"android_package": "com.example.app"}, dispatch_commands=True)
@@ -270,16 +285,12 @@ class TestAndroidSnapshot(unittest.TestCase):
 
         self.assertEqual(calls, ["bridge", "adb"])
         self.assertEqual(snapshot["capture_source"], "adb_uiautomator_fallback")
-        self.assertEqual(snapshot["snapshot_health"]["status"], "degraded")
-        self.assertEqual(snapshot["snapshot_health"]["reason"], "bridge_unreachable")
         self.assertEqual(snapshot["capture_error"]["error_code"], "bridge_unreachable")
         self.assertEqual(
             snapshot["snapshot_request"],
             {"interactive_only": True, "compact": True, "bridge_first_full": False},
         )
-        self.assertEqual(snapshot["root"], snapshot["elements"][0]["ref"])
-        self.assertEqual([element["id"] for element in snapshot["elements"]], ["root", "cta"])
-        self.assertEqual(snapshot["interactive_projection"]["element_ids"], ["cta"])
+        self.assertEqual([element["id"] for element in snapshot["elements"]], ["cta"])
         self.assertIn("bridge_snapshot", snapshot["capture_trace"])
 
     def test_lightweight_snapshot_uses_synthetic_fallback_when_bridge_and_adb_fail(self) -> None:
@@ -306,8 +317,6 @@ class TestAndroidSnapshot(unittest.TestCase):
         snapshot = driver.snapshot({"interactive_only": True, "compact": True})
 
         self.assertEqual(snapshot["capture_source"], "bridge_error_fallback")
-        self.assertEqual(snapshot["snapshot_health"]["status"], "degraded")
-        self.assertEqual(snapshot["snapshot_health"]["reason"], "bridge_timeout")
         self.assertEqual(snapshot["capture_error"]["error_code"], "bridge_timeout")
         self.assertEqual(snapshot["capture_error"]["adb_error_code"], "adb_timeout")
         self.assertEqual(

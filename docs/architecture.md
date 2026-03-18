@@ -45,9 +45,17 @@
 - If `selector` is present, resolution is mandatory even when coordinates are supplied.
 - Coordinate-only steps are accepted but skip drift detection and selector repair.
 - If selector resolution fails, actions fail with `selector_drift`.
+- If selector resolution is requested in ambiguity-safe mode, duplicate matches fail with `ambiguous_selector` instead of silently choosing the first candidate.
 - If `tap` cannot derive coordinates from selector bounds, actions fail with `missing_coordinates`.
 - Assertions use `selector` when provided; otherwise `target` is treated as `by: id`.
 - `input_text` without a selector relies on the currently focused field.
+
+## MCP screen introspection
+
+- `device_page_map` builds a compact current-screen structure view from the cached compact snapshot.
+- `device_element_dictionary` groups the current screen's elements by stable fields such as `id`, `resource_id`, `label`, `text`, and `content_desc`.
+- `device_press`, `device_fill`, and `device_verify` still accept the legacy `element` string path, but they can now also consume a structured selector plus ambiguity controls.
+- The intended operator flow is `device_snapshot` or `device_page_map` -> `device_element_dictionary` or `device_find` -> structured `device_press`/`device_fill`/`device_verify`.
 
 ## Selector migration workflow
 

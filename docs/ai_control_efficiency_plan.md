@@ -47,6 +47,29 @@ Reduce latency and failure rate when AI locates pages/elements and executes inte
 ### Tests
 - `python3 -m unittest tests.test_selectors tests.test_mcp_server`
 
+## Phase 2.5: Page Map And Ambiguity-Safe Resolution
+
+### Scope
+- Add `device_page_map` and `device_element_dictionary` so agents can inspect the current screen before acting.
+- Extend selector resolution with ambiguity-safe mode so repeated matches fail closed instead of silently resolving by path order.
+- Allow `device_press`, `device_fill`, and `device_verify` to accept structured selectors while keeping legacy `element` support.
+
+### Files
+- `harness/driver/selectors.py`
+- `harness/driver/device_bridge.py`
+- `tools/mcp_server.py`
+- `tests/test_selectors.py`
+- `tests/test_mcp_server.py`
+
+### Acceptance
+- Agents can request a current-screen structure summary without manually scanning the full raw snapshot.
+- Agents can request a grouped dictionary of current-screen ids, labels, and visible text values.
+- Structured selectors can opt into ambiguity-safe mode and receive `ambiguous_selector` plus candidates when resolution is not unique.
+- Legacy `element` calls still work unchanged.
+
+### Tests
+- `python3 -m unittest tests.test_selectors tests.test_mcp_server`
+
 ## Phase 3: Multiline Unicode Input in Harness
 
 ### Scope

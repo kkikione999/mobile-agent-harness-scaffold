@@ -100,3 +100,22 @@ python3 tools/device_harness.py press @e123456789
 python3 tools/device_harness.py fill search_box "hello"
 python3 tools/device_harness.py verify home_screen "home"
 ```
+
+## Live Android Verification
+
+Use `tools/live_android_verify.py` to validate the real post-`open` chain on a connected emulator/device and get JSON diagnostics when semantics drift from actual UI state.
+
+```bash
+python3 tools/live_android_verify.py \
+  --app com.utell.youtiao \
+  --serial emulator-5554 \
+  --press-target todo_calendar.search_bar \
+  --fill-target search.query_input \
+  --fill-text livecheck123
+```
+
+The script reuses `device_open`, `device_page_map`, `device_element_dictionary`, `device_press`, `device_fill`, `device_verify`, `inspect_android_bridge.py`, and an ADB `uiautomator dump` cross-check so it can distinguish:
+- bridge not healthy
+- bridge semantics not live
+- fill succeeded at transport level but text never appeared
+- fill changed the real UI but bridge semantics stayed stale
